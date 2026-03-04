@@ -1,7 +1,9 @@
-# Datasets (too large for GitHub, publicly downloadable)
+# Large dataset directories
 data/
-CIFAR-10/
-MNIST/
+
+# Model checkpoints and cached targets (large binary files)
+**/checkpoints/*.pt
+**/checkpoints/*.npz
 
 # Python
 __pycache__/
@@ -31,8 +33,5 @@ env/
 .DS_Store
 Thumbs.db
 
-# Logs and outputs
+# Logs
 *.log
-runs/
-checkpoints/
-outputs/
