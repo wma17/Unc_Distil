@@ -402,7 +402,7 @@ def main():
     if not os.path.exists(targets_path):
         raise FileNotFoundError(
             f"{targets_path} not found. Run:\n  python cache_ensemble_targets.py --save_dir {args.save_dir}")
-    data = np.load(targets_path)
+    data = np.load(targets_path, allow_pickle=True)
     train_probs, train_eu = data["train_probs"], data["train_eu"]
     test_probs, test_eu = data["test_probs"], data["test_eu"]
 
