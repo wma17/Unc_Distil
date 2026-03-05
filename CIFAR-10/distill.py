@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader, Dataset, ConcatDataset, TensorDataset
 from torchvision import datasets, transforms
 
 from models import cifar_resnet18_student
-from cache_ensemble_targets import apply_corruption, CORRUPTION_TYPES, CORRUPTION_SEED
+from cache_ensemble_targets import apply_corruption, CORRUPTION_TYPES, CORRUPTION_SEED, MIXUP_LAMBDAS, MASK_RATES
 
 
 CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
@@ -246,10 +246,10 @@ def build_phase2_datasets(args, data):
     clean_imgs, _ = _load_tensor_dataset(train_cifar)
     n_clean = len(clean_imgs)
 
-    # Target sizes for 50% ID, 25% shifted, 25% fake/real OOD
-    n_id = n_clean // 2
-    n_shifted = n_clean // 4
-    n_ood = n_clean // 4
+    # Target sizes: 50% ID=50k, 25% shifted=25k, 25% fake/real OOD=25k (total 100k)
+    n_id = n_clean          # 50000, use all clean
+    n_shifted = n_clean // 2   # 25000
+    n_ood = n_clean // 2       # 25000
     rng = np.random.RandomState(CORRUPTION_SEED)
 
     # --- ID: subsample clean ---
@@ -296,7 +296,7 @@ def build_phase2_datasets(args, data):
         idx_k = rng.choice(len(masked_eu), size=min(n_masked_target, len(masked_eu)), replace=False)
         ood_datasets.append(EUOnlyDataset(mixup_imgs[idx_m], mixup_eu[idx_m]))
         ood_datasets.append(EUOnlyDataset(masked_imgs[idx_k], masked_eu[idx_k]))
-        print(f"  Fake OOD: mixup={len(idx_m)}, masked={len(idx_k)} (λ∈{{0.2,0.4,0.6,0.8}}, mask_rates={{0.1,0.3,0.5}})")
+        print(f"  Fake OOD: mixup={len(idx_m)}, masked={len(idx_k)} (λ∈{MIXUP_LAMBDAS}, rates={MASK_RATES})")
 
     else:
         # Real OOD: SVHN + CIFAR-100

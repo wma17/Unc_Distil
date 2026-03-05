@@ -108,11 +108,11 @@ To teach the student to produce high EU across different input regimes, Phase 2 
 
 **Real OOD** (when available): SVHN + CIFAR-100
 
-**Fake OOD** (when OOD datasets are unavailable): mixup + masked samples, both derived from CIFAR-10 train only:
-- *Mixup* — λ ∈ {0.2, 0.4, 0.6, 0.8}
-- *Masked* — styles: random block, random pixel, center crop; rates: 0.1, 0.3, 0.5
+**Fake OOD** (when OOD datasets are unavailable): mixup + masked samples, both derived from CIFAR-10 train only. Stronger shift to mimic true OOD:
+- *Mixup* — λ ∈ {0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9}
+- *Masked* — styles: random block, random pixel, center crop, multi block, border; rates: 0.3, 0.5, 0.7, 0.8
 
-Use `--p2_data_mode fake_ood` in `cache_ensemble_targets.py` to enable fake OOD.
+Phase 2 data: 50% ID (50k) + 25% shifted ID (25k) + 25% fake OOD (25k) = 100k samples. Use `--p2_data_mode fake_ood` in `cache_ensemble_targets.py` to enable.
 
 ### Loss Functions
 
