@@ -16,10 +16,10 @@ Phase 1 — Classification KD:
 
 Phase 2 — EU head regression (backbone frozen, mixed data):
     L₂ = log1p_MSE(EU_S, EU_T) + β·PairwiseRankingLoss(EU_S, EU_T)
-    Training data: 50% clean + 25% corrupted + 25% OOD
+    Training data: 50% ID + 25% shifted ID + 25% OOD (or fake OOD)
 ```
 
-Experiments are provided for both **CIFAR-10** and **MNIST**.
+Experiments are provided for **CIFAR-10**, **MNIST**, and **TinyImageNet**.
 
 ---
 
@@ -30,12 +30,15 @@ unc_regression/
 ├── CIFAR-10/
 │   ├── models.py                  # Teacher (CIFARResNet18) + Student (dual-head)
 │   ├── train_ensemble.py          # Train diverse deep ensemble teacher
-│   ├── cache_ensemble_targets.py  # Cache teacher soft labels + EU targets
+│   ├── cache_ensemble_targets.py  # Cache teacher soft labels + EU targets (OOD or fake OOD)
 │   ├── distill.py                 # Two-phase distillation (Phase 1 + Phase 2)
 │   ├── evaluate_student.py        # Accuracy, EU correlation, OOD AUROC
 │   ├── evaluate_uncertainty.py    # Teacher ensemble uncertainty analysis
 │   ├── plot_eu.py                 # Visualize EU distributions
-│   └── figures/                   # Generated plots
+│   ├── uncertainty_cam.py        # Uncertainty-aware CAM visualization
+│   ├── uncertainty_cam_math.md   # EU-CAM derivation notes
+│   ├── figures/                   # Generated plots
+│   └── uncertainty_cam/           # CAM output directory
 ├── MNIST/
 │   ├── models.py
 │   ├── train_ensemble.py
@@ -43,6 +46,16 @@ unc_regression/
 │   ├── distill.py
 │   ├── evaluate_student.py
 │   └── plot_eu.py
+├── TinyImageNet/
+│   ├── models.py
+│   ├── data.py                    # TinyImageNet dataset loader
+│   ├── lora.py                    # LoRA adapter support
+│   ├── train_ensemble.py
+│   ├── cache_ensemble_targets.py
+│   ├── distill.py
+│   ├── evaluate_student.py
+│   └── plot_eu.py
+├── README.md
 └── requirements.txt
 ```
 
@@ -87,11 +100,19 @@ The EU head receives both backbone features and the model's own confidence (deta
 
 ### Phase 2 Mixed Training Data
 
-To teach the student to produce high EU on OOD inputs (not just the clean training distribution), Phase 2 uses a mixed dataset:
+To teach the student to produce high EU across different input regimes, Phase 2 uses a mixed dataset with fixed ratios:
 
-- **50% clean CIFAR-10** — low EU baseline
-- **25% corrupted CIFAR-10** — medium EU (Gaussian noise, blur, brightness, contrast, pixelate)
-- **25% OOD** — high EU (SVHN + CIFAR-100)
+- **50% ID (clean)** — low EU baseline
+- **25% shifted ID (corrupted)** — medium EU (Gaussian noise, blur, low contrast)
+- **25% OOD or fake OOD** — high EU
+
+**Real OOD** (when available): SVHN + CIFAR-100
+
+**Fake OOD** (when OOD datasets are unavailable): mixup + masked samples, both derived from CIFAR-10 train only:
+- *Mixup* — λ ∈ {0.2, 0.4, 0.6, 0.8}
+- *Masked* — styles: random block, random pixel, center crop; rates: 0.1, 0.3, 0.5
+
+Use `--p2_data_mode fake_ood` in `cache_ensemble_targets.py` to enable fake OOD.
 
 ### Loss Functions
 
@@ -125,7 +146,11 @@ python train_ensemble.py --num_members 5 --epochs 200 --gpu 0
 
 **Step 2 — Cache teacher targets** (soft labels + EU scores for all splits + OOD datasets)
 ```bash
+# With real OOD (SVHN, CIFAR-100)
 python cache_ensemble_targets.py --save_dir ./checkpoints --gpu 0
+
+# With fake OOD only (mixup + masked, no external datasets)
+python cache_ensemble_targets.py --save_dir ./checkpoints --gpu 0 --p2_data_mode fake_ood
 ```
 
 **Step 3 — Distill into student**
@@ -147,12 +172,19 @@ python evaluate_student.py --save_dir ./checkpoints --gpu 0
 python plot_eu.py --save_dir ./checkpoints
 ```
 
+**Optional — Uncertainty-aware CAM**
+```bash
+python uncertainty_cam.py --save_dir ./checkpoints --out_dir ./uncertainty_cam
+```
+
 ### Key Arguments
 
 | Script | Argument | Default | Description |
 |---|---|---|---|
 | `train_ensemble.py` | `--num_members` | 5 | Ensemble size |
 | `train_ensemble.py` | `--no_diversity` | False | Ablation: seed-only diversity |
+| `cache_ensemble_targets.py` | `--p2_data_mode` | ood | `ood` or `fake_ood` |
+| `cache_ensemble_targets.py` | `--fake_ood_mixup_frac` | 0.5 | Fraction of fake OOD from mixup (rest masked) |
 | `distill.py` | `--alpha` | 0.7 | KD weight for Phase 1 |
 | `distill.py` | `--tau` | 4.0 | Temperature for Phase 1 |
 | `distill.py` | `--rank_weight` | 1.0 | β weight for ranking loss in Phase 2 |

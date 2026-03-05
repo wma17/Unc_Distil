@@ -33,6 +33,12 @@ EPS = 1e-8
 CORRUPTION_SEED = 2026
 CORRUPTION_TYPES = ["gaussian_noise", "gaussian_blur", "low_contrast"]
 
+# Fake OOD: mixup and masking (used when real OOD unavailable)
+FAKE_OOD_SEED = 2027
+MIXUP_LAMBDAS = [0.2, 0.4, 0.6, 0.8]  # interpolation rates
+MASK_STYLES = ["random_block", "random_pixel", "center_crop_mask"]
+MASK_RATES = [0.1, 0.3, 0.5]  # fraction of image masked
+
 
 def load_ensemble(save_dir, device, num_classes=10):
     members = []
@@ -113,6 +119,69 @@ def apply_corruption(images_tensor, corruption_type, seed=CORRUPTION_SEED):
         raise ValueError(f"Unknown corruption: {corruption_type}")
 
 
+# ---------------------------------------------------------------------------
+# Fake OOD: mixup and masking (deterministic, seed-based)
+# ---------------------------------------------------------------------------
+
+def apply_masking(images_tensor, style, rate, seed=FAKE_OOD_SEED):
+    """Apply deterministic masking. Returns masked images (masked regions = 0)."""
+    n, c, h, w = images_tensor.shape
+    rng = torch.Generator(device=images_tensor.device).manual_seed(seed)
+    out = images_tensor.clone()
+
+    if style == "random_block":
+        # Mask a random square region; rate = fraction of image area
+        side = max(1, int((rate * h * w) ** 0.5))
+        for i in range(n):
+            si = int(torch.randint(0, h - side + 1 if h >= side else 1, (1,), generator=rng).item())
+            sj = int(torch.randint(0, w - side + 1 if w >= side else 1, (1,), generator=rng).item())
+            out[i, :, si:si + side, sj:sj + side] = 0
+
+    elif style == "random_pixel":
+        # Random pixel dropout; rate = fraction of pixels masked
+        mask = torch.rand(n, 1, h, w, device=images_tensor.device, generator=rng) > rate
+        out = out * mask.float()
+
+    elif style == "center_crop_mask":
+        # Mask center square; rate = fraction of area
+        side = max(1, int((rate * h * w) ** 0.5))
+        top, left = (h - side) // 2, (w - side) // 2
+        out[:, :, top:top + side, left:left + side] = 0
+
+    else:
+        raise ValueError(f"Unknown mask style: {style}")
+    return out
+
+
+def generate_fake_ood(images_tensor, n_mixup, n_masked, seed=FAKE_OOD_SEED):
+    """Generate mixup and masked samples. Returns (mixup_imgs, masked_imgs) for teacher EU."""
+    n = len(images_tensor)
+    rng = np.random.RandomState(seed)
+
+    # Mixup: random pairs, cycling through lambdas (0.2, 0.4, 0.6, 0.8)
+    mixup_tensors = []
+    idx_perm = rng.permutation(n)
+    for k in range(n_mixup):
+        i = int(idx_perm[(2 * k) % n])
+        j = int(idx_perm[(2 * k + 1) % n])
+        lam = MIXUP_LAMBDAS[k % len(MIXUP_LAMBDAS)]
+        x = (lam * images_tensor[i:i + 1] + (1 - lam) * images_tensor[j:j + 1]).clamp(0, 1)
+        mixup_tensors.append(x)
+    mixup_imgs = torch.cat(mixup_tensors, dim=0)
+
+    # Masked: cycle through (style, rate) combinations
+    combos = [(s, r) for s in MASK_STYLES for r in MASK_RATES]
+    masked_tensors = []
+    for k in range(n_masked):
+        idx = rng.randint(0, n)
+        style, rate = combos[k % len(combos)]
+        masked = apply_masking(images_tensor[idx:idx + 1], style, rate, seed=seed + 10000 + k)
+        masked_tensors.append(masked)
+    masked_imgs = torch.cat(masked_tensors, dim=0)
+
+    return mixup_imgs, masked_imgs
+
+
 def get_clean_tensors(dataset, batch_size=256):
     """Load an entire dataset as a single (images, labels) tensor pair."""
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
@@ -130,6 +199,10 @@ def main():
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--p2_data_mode", type=str, default="ood", choices=["ood", "fake_ood"],
+                        help="Phase 2 data: 'ood'=real OOD (SVHN,CIFAR-100), 'fake_ood'=mixup+masked only")
+    parser.add_argument("--fake_ood_mixup_frac", type=float, default=0.5,
+                        help="Of the 25%% fake OOD, fraction from mixup (rest from masked). Default 0.5 = 12.5%% each")
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.gpu}" if args.gpu >= 0 and torch.cuda.is_available() else "cpu")
@@ -196,33 +269,59 @@ def main():
         results[f"corrupt_{ctype}_test_au"] = c_au
         print(f"    TU={c_tu.mean():.4f}  AU={c_au.mean():.4f}  EU={c_eu.mean():.4f}")
 
-    # === 3. OOD datasets ===
-    ood_transform = transforms.Compose([
-        transforms.Resize((32, 32)),
-        transforms.ToTensor(),
-        transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
-    ])
+    # === 3. OOD or Fake OOD (mixup + masked) ===
+    if args.p2_data_mode == "ood":
+        ood_transform = transforms.Compose([
+            transforms.Resize((32, 32)),
+            transforms.ToTensor(),
+            transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
+        ])
 
-    # SVHN
-    print("\n--- SVHN test (OOD) ---")
-    svhn_set = datasets.SVHN(root=os.path.join(args.data_dir, "svhn"), split="test",
-                             download=True, transform=ood_transform)
-    svhn_loader = DataLoader(svhn_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-    _probs, svhn_tu, svhn_au, svhn_eu, _ = compute_teacher_targets(members, svhn_loader, device)
-    results["svhn_eu"] = svhn_eu
-    results["svhn_tu"] = svhn_tu
-    results["svhn_au"] = svhn_au
-    print(f"  TU={svhn_tu.mean():.4f}  AU={svhn_au.mean():.4f}  EU={svhn_eu.mean():.4f}  n={len(svhn_eu)}")
+        # SVHN
+        print("\n--- SVHN test (OOD) ---")
+        svhn_set = datasets.SVHN(root=os.path.join(args.data_dir, "svhn"), split="test",
+                                 download=True, transform=ood_transform)
+        svhn_loader = DataLoader(svhn_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+        _probs, svhn_tu, svhn_au, svhn_eu, _ = compute_teacher_targets(members, svhn_loader, device)
+        results["svhn_eu"] = svhn_eu
+        results["svhn_tu"] = svhn_tu
+        results["svhn_au"] = svhn_au
+        print(f"  TU={svhn_tu.mean():.4f}  AU={svhn_au.mean():.4f}  EU={svhn_eu.mean():.4f}  n={len(svhn_eu)}")
 
-    # CIFAR-100
-    print("\n--- CIFAR-100 test (OOD) ---")
-    c100_set = datasets.CIFAR100(root=args.data_dir, train=False, download=True, transform=clean_transform)
-    c100_loader = DataLoader(c100_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-    _probs, c100_tu, c100_au, c100_eu, _ = compute_teacher_targets(members, c100_loader, device)
-    results["cifar100_eu"] = c100_eu
-    results["cifar100_tu"] = c100_tu
-    results["cifar100_au"] = c100_au
-    print(f"  TU={c100_tu.mean():.4f}  AU={c100_au.mean():.4f}  EU={c100_eu.mean():.4f}  n={len(c100_eu)}")
+        # CIFAR-100
+        print("\n--- CIFAR-100 test (OOD) ---")
+        c100_set = datasets.CIFAR100(root=args.data_dir, train=False, download=True, transform=clean_transform)
+        c100_loader = DataLoader(c100_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+        _probs, c100_tu, c100_au, c100_eu, _ = compute_teacher_targets(members, c100_loader, device)
+        results["cifar100_eu"] = c100_eu
+        results["cifar100_tu"] = c100_tu
+        results["cifar100_au"] = c100_au
+        print(f"  TU={c100_tu.mean():.4f}  AU={c100_au.mean():.4f}  EU={c100_eu.mean():.4f}  n={len(c100_eu)}")
+
+    else:
+        # Fake OOD: mixup + masked (no external OOD data needed)
+        # 25% of train size = fake OOD; split by mixup_frac
+        n_fake = len(train_imgs) // 4
+        n_mixup = int(n_fake * args.fake_ood_mixup_frac)
+        n_masked = n_fake - n_mixup
+        print(f"\n--- Fake OOD (mixup + masked, no external data) ---")
+        print(f"  Target: 50% ID, 25% shifted, 25% fake OOD (mixup={n_mixup}, masked={n_masked})")
+
+        mixup_imgs, masked_imgs = generate_fake_ood(train_imgs, n_mixup, n_masked, seed=FAKE_OOD_SEED)
+
+        mixup_ds = TensorDataset(mixup_imgs, torch.zeros(len(mixup_imgs), dtype=torch.long))
+        mixup_loader = DataLoader(mixup_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+        _probs, mixup_tu, mixup_au, mixup_eu, _ = compute_teacher_targets(members, mixup_loader, device)
+        results["fake_mixup_eu"] = mixup_eu
+        results["fake_mixup_imgs"] = mixup_imgs.numpy()
+        print(f"  Mixup (λ∈{{0.2,0.4,0.6,0.8}}): n={len(mixup_eu)}  EU mean={mixup_eu.mean():.4f}")
+
+        masked_ds = TensorDataset(masked_imgs, torch.zeros(len(masked_imgs), dtype=torch.long))
+        masked_loader = DataLoader(masked_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+        _probs, masked_tu, masked_au, masked_eu, _ = compute_teacher_targets(members, masked_loader, device)
+        results["fake_masked_eu"] = masked_eu
+        results["fake_masked_imgs"] = masked_imgs.numpy()
+        print(f"  Masked (styles={MASK_STYLES}, rates={MASK_RATES}): n={len(masked_eu)}  EU mean={masked_eu.mean():.4f}")
 
     # === 4. Unseen OOD datasets (not used in Phase 2 training) ===
     # Grayscale datasets need 3-channel conversion
@@ -266,6 +365,8 @@ def main():
     # === Save ===
     results["eu_max"] = np.array(float(train_eu.max()))
     results["corruption_seed"] = np.array(CORRUPTION_SEED)
+    results["p2_data_mode"] = np.array([args.p2_data_mode], dtype=object)
+    results["fake_ood_mixup_frac"] = np.array(args.fake_ood_mixup_frac)
 
     out_path = os.path.join(args.save_dir, "teacher_targets.npz")
     np.savez(out_path, **results)

@@ -26,7 +26,7 @@
     "data_fraction": 0.87,
     "lr": 0.1198,
     "weight_decay": 0.0003,
-    "lr_schedule": "cosine_warm",
+    "lr_schedule": "step",
     "head_init_scale": 0.965
   },
   {
@@ -42,36 +42,6 @@
     "lr": 0.06,
     "weight_decay": 0.001,
     "lr_schedule": "step",
-    "head_init_scale": 1.483
-  },
-  {
-    "member_id": 3,
-    "seed": 45,
-    "augmentations": [
-      "autoaugment",
-      "randerasing"
-    ],
-    "label_smoothing": 0.0041,
-    "dropout_rate": 0.05,
-    "data_fraction": 0.8,
-    "lr": 0.0984,
-    "weight_decay": 0.0003,
-    "lr_schedule": "cosine_warm",
-    "head_init_scale": 1.214
-  },
-  {
-    "member_id": 4,
-    "seed": 46,
-    "augmentations": [
-      "colorjitter",
-      "cutout"
-    ],
-    "label_smoothing": 0.0258,
-    "dropout_rate": 0.1,
-    "data_fraction": 0.91,
-    "lr": 0.1302,
-    "weight_decay": 0.0003,
-    "lr_schedule": "cosine",
-    "head_init_scale": 1.182
+    "head_init_scale": 1.071
   }
 ]

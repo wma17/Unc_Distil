@@ -227,7 +227,7 @@ def eval_phase2(model, loader, device):
 # ---------------------------------------------------------------------------
 
 def build_phase2_datasets(args, data):
-    """Build mixed training dataset: clean + corrupted + OOD.
+    """Build mixed training dataset: 50% ID + 25% shifted ID + 25% (OOD or fake OOD).
 
     Returns (train_dataset, test_dataset) where each yields (image, eu_target).
     """
@@ -244,11 +244,22 @@ def build_phase2_datasets(args, data):
     # --- Clean CIFAR-10 train ---
     train_cifar = datasets.CIFAR10(root=args.data_dir, train=True, download=True, transform=clean_transform)
     clean_imgs, _ = _load_tensor_dataset(train_cifar)
-    clean_train_ds = EUOnlyDataset(clean_imgs, data["train_eu"])
+    n_clean = len(clean_imgs)
 
-    # --- Corrupted CIFAR-10 train ---
-    corrupt_datasets = []
-    n_per_corruption = len(clean_imgs) // (2 * len(CORRUPTION_TYPES))
+    # Target sizes for 50% ID, 25% shifted, 25% fake/real OOD
+    n_id = n_clean // 2
+    n_shifted = n_clean // 4
+    n_ood = n_clean // 4
+    rng = np.random.RandomState(CORRUPTION_SEED)
+
+    # --- ID: subsample clean ---
+    idx_id = rng.choice(n_clean, size=n_id, replace=False)
+    clean_train_ds = EUOnlyDataset(clean_imgs[idx_id], data["train_eu"][idx_id])
+    print(f"  ID (clean): {n_id} samples, EU mean={data['train_eu'][idx_id].mean():.4f}")
+
+    # --- Shifted ID: corrupted CIFAR-10 (combine corruption types) ---
+    corrupt_parts = []
+    n_per_corruption = n_shifted // len(CORRUPTION_TYPES)
     for ctype in CORRUPTION_TYPES:
         key = f"corrupt_{ctype}_eu"
         if key not in data:
@@ -256,44 +267,61 @@ def build_phase2_datasets(args, data):
             continue
         corrupted_imgs = apply_corruption(clean_imgs, ctype, seed=CORRUPTION_SEED)
         eu = data[key]
-        # Subsample to keep total corrupted ≈ 50% of clean
-        rng = np.random.RandomState(CORRUPTION_SEED)
         idx = rng.choice(len(eu), size=min(n_per_corruption, len(eu)), replace=False)
-        corrupt_datasets.append(EUOnlyDataset(corrupted_imgs[idx], eu[idx]))
-        print(f"  Corrupted {ctype}: {len(idx)} samples, EU mean={eu[idx].mean():.4f}")
+        corrupt_parts.append(EUOnlyDataset(corrupted_imgs[idx], eu[idx]))
+    n_corrupt_actual = sum(len(d) for d in corrupt_parts)
+    if corrupt_parts:
+        print(f"  Shifted (corrupted): {n_corrupt_actual} samples")
 
-    # --- OOD: SVHN ---
+    # --- OOD or Fake OOD ---
+    p2_mode = data.get("p2_data_mode", "ood")
+    if hasattr(p2_mode, "flat"):
+        p2_mode = str(p2_mode.flat[0]) if p2_mode.size else "ood"
+    else:
+        p2_mode = str(p2_mode)
+
     ood_datasets = []
-    if "svhn_eu" in data:
-        svhn_set = datasets.SVHN(root=os.path.join(args.data_dir, "svhn"), split="test",
-                                 download=True, transform=ood_transform)
-        svhn_imgs, _ = _load_tensor_dataset(svhn_set)
-        svhn_eu = data["svhn_eu"]
-        # Subsample OOD to ~25% of clean total
-        n_ood_target = len(clean_imgs) // 4
-        n_svhn = min(n_ood_target // 2, len(svhn_eu))
-        rng = np.random.RandomState(CORRUPTION_SEED + 1)
-        idx = rng.choice(len(svhn_eu), size=n_svhn, replace=False)
-        ood_datasets.append(EUOnlyDataset(svhn_imgs[idx], svhn_eu[idx]))
-        print(f"  SVHN OOD: {n_svhn} samples, EU mean={svhn_eu[idx].mean():.4f}")
+    if p2_mode == "fake_ood" and "fake_mixup_eu" in data:
+        # Fake OOD: mixup + masked (from cache)
+        mixup_imgs = torch.from_numpy(data["fake_mixup_imgs"]).float()
+        mixup_eu = data["fake_mixup_eu"]
+        masked_imgs = torch.from_numpy(data["fake_masked_imgs"]).float()
+        masked_eu = data["fake_masked_eu"]
+        mf = data.get("fake_ood_mixup_frac", np.array(0.5))
+        mixup_frac = float(mf.flat[0]) if hasattr(mf, "flat") and mf.size else 0.5
+        n_mixup_target = int(n_ood * mixup_frac)
+        n_masked_target = n_ood - n_mixup_target
+        # Subsample to exact n_ood
+        idx_m = rng.choice(len(mixup_eu), size=min(n_mixup_target, len(mixup_eu)), replace=False)
+        idx_k = rng.choice(len(masked_eu), size=min(n_masked_target, len(masked_eu)), replace=False)
+        ood_datasets.append(EUOnlyDataset(mixup_imgs[idx_m], mixup_eu[idx_m]))
+        ood_datasets.append(EUOnlyDataset(masked_imgs[idx_k], masked_eu[idx_k]))
+        print(f"  Fake OOD: mixup={len(idx_m)}, masked={len(idx_k)} (λ∈{{0.2,0.4,0.6,0.8}}, mask_rates={{0.1,0.3,0.5}})")
 
-    # --- OOD: CIFAR-100 ---
-    if "cifar100_eu" in data:
-        c100_set = datasets.CIFAR100(root=args.data_dir, train=False, download=True, transform=clean_transform)
-        c100_imgs, _ = _load_tensor_dataset(c100_set)
-        c100_eu = data["cifar100_eu"]
-        n_c100 = min(n_ood_target - n_svhn if "svhn_eu" in data else n_ood_target // 2, len(c100_eu))
-        rng = np.random.RandomState(CORRUPTION_SEED + 2)
-        idx = rng.choice(len(c100_eu), size=n_c100, replace=False)
-        ood_datasets.append(EUOnlyDataset(c100_imgs[idx], c100_eu[idx]))
-        print(f"  CIFAR-100 OOD: {n_c100} samples, EU mean={c100_eu[idx].mean():.4f}")
+    else:
+        # Real OOD: SVHN + CIFAR-100
+        n_svhn = n_ood // 2
+        n_c100 = n_ood - n_svhn
+        if "svhn_eu" in data:
+            svhn_set = datasets.SVHN(root=os.path.join(args.data_dir, "svhn"), split="test",
+                                    download=True, transform=ood_transform)
+            svhn_imgs, _ = _load_tensor_dataset(svhn_set)
+            svhn_eu = data["svhn_eu"]
+            idx = rng.choice(len(svhn_eu), size=min(n_svhn, len(svhn_eu)), replace=False)
+            ood_datasets.append(EUOnlyDataset(svhn_imgs[idx], svhn_eu[idx]))
+            print(f"  SVHN OOD: {len(idx)} samples")
+        if "cifar100_eu" in data:
+            c100_set = datasets.CIFAR100(root=args.data_dir, train=False, download=True, transform=clean_transform)
+            c100_imgs, _ = _load_tensor_dataset(c100_set)
+            c100_eu = data["cifar100_eu"]
+            idx = rng.choice(len(c100_eu), size=min(n_c100, len(c100_eu)), replace=False)
+            ood_datasets.append(EUOnlyDataset(c100_imgs[idx], c100_eu[idx]))
+            print(f"  CIFAR-100 OOD: {len(idx)} samples")
 
-    all_train_parts = [clean_train_ds] + corrupt_datasets + ood_datasets
+    all_train_parts = [clean_train_ds] + corrupt_parts + ood_datasets
     train_dataset = ConcatDataset(all_train_parts)
     total_n = sum(len(d) for d in all_train_parts)
-    print(f"  Phase 2 total training samples: {total_n} "
-          f"(clean={len(clean_train_ds)}, corrupted={sum(len(d) for d in corrupt_datasets)}, "
-          f"ood={sum(len(d) for d in ood_datasets)})")
+    print(f"  Phase 2 total: {total_n} (50% ID={n_id}, 25% shifted={n_corrupt_actual}, 25% OOD={n_ood})")
 
     # --- Test: clean CIFAR-10 only (for consistent eval metric) ---
     test_cifar = datasets.CIFAR10(root=args.data_dir, train=False, download=True, transform=clean_transform)
