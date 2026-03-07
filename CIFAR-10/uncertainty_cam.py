@@ -1,28 +1,20 @@
 """
-UncertaintyCAM: Gradient-based saliency maps for epistemic uncertainty.
+UncertaintyCAM: Attribution maps for epistemic uncertainty and prediction.
 
-Similar to GradCAM but for uncertainty visualization:
+Attribution methods:
+- **GradCAM**: Spatial heatmap from layer4 activations (interpretable, fast)
+- **Integrated Gradients (IG)**: Axiomatically-grounded pixel attribution; interpolates
+  baseline→input and integrates gradients. Better than vanilla gradient saliency.
 
-1. **Teacher (BNN Ensemble)**: EU = H(mean_probs) - mean(H(member_probs)).
-   For each member, we compute GradCAM using the gradient of EU w.r.t. that
-   member's last conv layer. Since EU depends on all members' predictions,
-   we aggregate member-wise CAMs (weighted by gradient flow) into a single
-   teacher uncertainty map.
+1. **Teacher EU**: GradCAM or IG of ensemble epistemic uncertainty
+2. **Student EU**: GradCAM or IG of student EU head (full attribution: backbone + probs path)
+3. **Teacher / Student prediction**: Gradient or IG saliency of predicted-class logit
 
-2. **Student**: EU is predicted by a scalar regressor head. We compute
-   GradCAM using ∂EU/∂features from the last conv layer (layer4).
-
-Output: For each dataset (ID, shifted ID, OOD), cases with:
-  - Original image
-  - BNN Teacher Uncertainty Map
-  - Student EU Map
-
-Cases are selected by ranking by (teacher) epistemic uncertainty and
-sampling across different uncertainty levels.
+Output: 5 panels — Original | Teacher EU | Student EU | Teacher Pred | Student Pred
 
 Usage:
     python uncertainty_cam.py --save_dir ./checkpoints --out_dir ./uncertainty_cam --gpu 0
-    python uncertainty_cam.py --save_dir ./checkpoints --datasets id shifted ood --n_per_dataset 35 --gpu 0
+    python uncertainty_cam.py --attribution_method ig --ig_steps 50  # Use Integrated Gradients
 """
 
 import argparse
@@ -178,17 +170,37 @@ def compute_teacher_uncertainty_cam(members, x, device):
 # Student UncertaintyCAM
 # ---------------------------------------------------------------------------
 
-def compute_student_uncertainty_cam(model, x, device):
+def _student_forward_no_detach(model, x):
+    """Forward pass without detaching probs, so gradients flow through prediction path."""
+    out = F.relu(model.bn1(model.conv1(x)))
+    out = model.layer1(out)
+    out = model.layer2(out)
+    out = model.layer3(out)
+    out = model.layer4(out)
+    out = model.avgpool(out)
+    feat = out.view(out.size(0), -1)
+    logits = model.fc(feat)
+    probs = F.softmax(logits, dim=-1)  # NO detach — full gradient flow
+    eu_in = torch.cat([feat, probs], dim=-1)
+    eu = model.eu_act(model.eu_fc2(F.relu(model.eu_fc1(eu_in)))).squeeze(-1)
+    return out, logits, eu
+
+
+def compute_student_uncertainty_cam(model, x, device, include_probs_path=True):
     """
     Compute GradCAM for student epistemic uncertainty head.
 
-    EU is a scalar from the EU regression head. We backprop ∂EU/∂features
-    through the backbone. The EU head receives (feat, probs) but probs is
-    detached, so gradients flow only through feat -> layer4.
+    By default (include_probs_path=True): Full attribution — gradients flow through
+    both backbone features AND the prediction (logits→probs) path. The trained
+    model uses probs.detach() for Phase 2; here we do a separate forward without
+    detach to capture how prediction uncertainty affects EU.
+
+    If include_probs_path=False: Only backbone path (matches trained forward).
 
     Args:
         model: CIFARResNetStudent
         x: (1, 3, 32, 32) input tensor, requires_grad=True
+        include_probs_path: if True, probs not detached so prediction path contributes
     Returns:
         cam: (32, 32) numpy array, normalized [0, 1]
     """
@@ -211,7 +223,10 @@ def compute_student_uncertainty_cam(model, x, device):
         if not x.requires_grad:
             x.requires_grad_(True)
 
-        logits, eu = model(x)
+        if include_probs_path:
+            _, _, eu = _student_forward_no_detach(model, x)
+        else:
+            logits, eu = model(x)
         eu = eu.squeeze()
         eu.backward()
 
@@ -233,6 +248,128 @@ def compute_student_uncertainty_cam(model, x, device):
     finally:
         h_fwd.remove()
         h_bwd.remove()
+
+
+# ---------------------------------------------------------------------------
+# Traditional saliency: gradient of predicted-class logit w.r.t. input
+# ---------------------------------------------------------------------------
+
+def compute_teacher_prediction_saliency(members, x, pred_class, device):
+    """Saliency for teacher: gradient of mean logit for pred_class w.r.t. input."""
+    x = x.to(device)
+    if not x.requires_grad:
+        x.requires_grad_(True)
+    all_logits = torch.stack([m(x) for m in members], dim=1)  # (1, M, C)
+    mean_logits = all_logits.mean(dim=1)  # (1, C)
+    score = mean_logits[0, pred_class]
+    score.backward()
+    sal = x.grad.abs().sum(dim=1).squeeze(0).cpu().numpy()
+    if sal.max() > 0:
+        sal = sal / sal.max()
+    return sal.astype(np.float32)
+
+
+def compute_student_prediction_saliency(model, x, pred_class, device):
+    """Saliency for student: gradient of logit for pred_class w.r.t. input."""
+    x = x.to(device)
+    if not x.requires_grad:
+        x.requires_grad_(True)
+    logits, _ = model(x)
+    score = logits[0, pred_class]
+    score.backward()
+    sal = x.grad.abs().sum(dim=1).squeeze(0).cpu().numpy()
+    if sal.max() > 0:
+        sal = sal / sal.max()
+    return sal.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Integrated Gradients (Sundararajan et al.)
+# ---------------------------------------------------------------------------
+
+def get_baseline(image, baseline_type="black"):
+    """Baseline for IG: black image in normalized CIFAR space."""
+    if baseline_type == "black":
+        bl = torch.zeros_like(image, device=image.device)
+        for c in range(3):
+            bl[:, c, :, :] = -CIFAR10_MEAN[c] / CIFAR10_STD[c]
+        return bl
+    elif baseline_type == "zero":
+        return torch.zeros_like(image, device=image.device)
+    return torch.zeros_like(image, device=image.device)
+
+
+def integrated_gradients(scalar_fn, image, baseline, device, steps=50):
+    """
+    Integrated Gradients: attribution of scalar_fn(x) w.r.t. input.
+    IG(x) = (x - baseline) * integral_0^1 grad_scalar_fn(baseline + a*(x-baseline)) da
+
+    Args:
+        scalar_fn: callable(x) -> scalar tensor
+        image: (1, C, H, W)
+        baseline: (1, C, H, W)
+        device, steps
+    Returns:
+        attr: (H, W) numpy, normalized [0, 1]
+    """
+    accumulated = torch.zeros_like(image, device=device)
+    for step in range(steps + 1):
+        alpha = step / steps
+        interp = baseline + alpha * (image - baseline)
+        interp = interp.detach().requires_grad_(True)
+        out = scalar_fn(interp)
+        out.backward()
+        if interp.grad is not None:
+            accumulated += interp.grad
+    ig = (image - baseline) * accumulated / steps
+    sal = ig.abs().sum(dim=1).squeeze(0).cpu().numpy()
+    if sal.max() > 0:
+        sal = sal / sal.max()
+    return sal.astype(np.float32)
+
+
+def compute_teacher_eu_ig(members, x, device, baseline=None, steps=50):
+    """IG of teacher ensemble EU w.r.t. input."""
+    def fn(x_in):
+        logits = torch.stack([m(x_in) for m in members], dim=1)
+        probs = F.softmax(logits, dim=-1)
+        mean_p = probs.mean(dim=1)
+        tu = entropy(mean_p)
+        au = entropy(probs).mean(dim=1)
+        return (tu - au).squeeze()
+    x = x.to(device)
+    baseline = baseline if baseline is not None else get_baseline(x).to(device)
+    return integrated_gradients(fn, x, baseline, device, steps)
+
+
+def compute_student_eu_ig(model, x, device, baseline=None, steps=50):
+    """IG of student EU w.r.t. input (full path, no detach)."""
+    def fn(x_in):
+        _, _, eu = _student_forward_no_detach(model, x_in)
+        return eu.squeeze()
+    x = x.to(device)
+    baseline = baseline if baseline is not None else get_baseline(x).to(device)
+    return integrated_gradients(fn, x, baseline, device, steps)
+
+
+def compute_teacher_pred_ig(members, x, pred_class, device, baseline=None, steps=50):
+    """IG of teacher mean logit for pred_class w.r.t. input."""
+    def fn(x_in):
+        logits = torch.stack([m(x_in) for m in members], dim=1).mean(dim=1)
+        return logits[0, pred_class]
+    x = x.to(device)
+    baseline = baseline if baseline is not None else get_baseline(x).to(device)
+    return integrated_gradients(fn, x, baseline, device, steps)
+
+
+def compute_student_pred_ig(model, x, pred_class, device, baseline=None, steps=50):
+    """IG of student logit for pred_class w.r.t. input."""
+    def fn(x_in):
+        logits, _ = model(x_in)
+        return logits[0, pred_class]
+    x = x.to(device)
+    baseline = baseline if baseline is not None else get_baseline(x).to(device)
+    return integrated_gradients(fn, x, baseline, device, steps)
 
 
 # ---------------------------------------------------------------------------
@@ -265,32 +402,43 @@ def select_cases_by_uncertainty(teacher_eu, n_cases=100):
     return ranked_idx[positions]
 
 
-def plot_single_case(original_img, teacher_cam, student_cam, teacher_eu, student_eu,
-                    pred_teacher, pred_student, save_path, true_label_str=None):
-    """Create one figure: Original | Teacher CAM | Student CAM.
-    true_label_str: e.g. 'cat' for ID, or 'OOD (SVHN)' for OOD. If None, not shown.
-    """
-    fig, axes = plt.subplots(1, 3, figsize=(9, 3.2))
+def plot_single_case(original_img, teacher_cam, student_cam, teacher_sal, student_sal,
+                    teacher_eu, student_eu, pred_teacher, pred_student,
+                    save_path, true_label_str=None, method_label="GradCAM"):
+    """Create one figure: Original | Teacher EU | Student EU | Teacher Pred | Student Pred."""
+    fig, axes = plt.subplots(1, 5, figsize=(15, 3.2))
 
     # Original
     axes[0].imshow(original_img)
     orig_title = "Original"
     if true_label_str:
         orig_title += f"\n{true_label_str}"
-    axes[0].set_title(orig_title, fontsize=10)
+    axes[0].set_title(orig_title, fontsize=9)
     axes[0].axis("off")
 
-    # Teacher
+    # Teacher EU
     axes[1].imshow(original_img)
     axes[1].imshow(teacher_cam, cmap="jet", alpha=0.5)
-    axes[1].set_title(f"Teacher EU Map\nEU={teacher_eu:.4f}  Pred: {CIFAR10_CLASSES[pred_teacher]}", fontsize=10)
+    axes[1].set_title(f"Teacher EU ({method_label})\nEU={teacher_eu:.4f} Pred:{CIFAR10_CLASSES[pred_teacher]}", fontsize=9)
     axes[1].axis("off")
 
-    # Student
+    # Student EU
     axes[2].imshow(original_img)
     axes[2].imshow(student_cam, cmap="jet", alpha=0.5)
-    axes[2].set_title(f"Student EU Map\nEU={student_eu:.4f}  Pred: {CIFAR10_CLASSES[pred_student]}", fontsize=10)
+    axes[2].set_title(f"Student EU ({method_label})\nEU={student_eu:.4f} Pred:{CIFAR10_CLASSES[pred_student]}", fontsize=9)
     axes[2].axis("off")
+
+    # Teacher prediction
+    axes[3].imshow(original_img)
+    axes[3].imshow(teacher_sal, cmap="hot", alpha=0.5)
+    axes[3].set_title(f"Teacher Pred ({method_label})\nlogit[{CIFAR10_CLASSES[pred_teacher]}]", fontsize=9)
+    axes[3].axis("off")
+
+    # Student prediction
+    axes[4].imshow(original_img)
+    axes[4].imshow(student_sal, cmap="hot", alpha=0.5)
+    axes[4].set_title(f"Student Pred ({method_label})\nlogit[{CIFAR10_CLASSES[pred_student]}]", fontsize=9)
+    axes[4].axis("off")
 
     fig.tight_layout()
     fig.savefig(save_path, bbox_inches="tight", dpi=120)
@@ -298,35 +446,56 @@ def plot_single_case(original_img, teacher_cam, student_cam, teacher_eu, student
 
 
 def run_dataset_cam(members, student, dataset_name, all_images, teacher_eu, student_eu_all,
-                    pred_teacher, pred_student, label_str_fn, out_dir, n_cases, device):
+                    pred_teacher, pred_student, label_str_fn, out_dir, n_cases, device,
+                    attribution_method="gradcam", ig_steps=50):
     """
-    Run UncertaintyCAM for one dataset. all_labels can be CIFAR-10 indices or None for OOD.
-    label_str_fn(idx) returns string for true label display, or None.
+    Run attribution for one dataset.
+    attribution_method: "gradcam" or "ig"
     """
     indices = select_cases_by_uncertainty(teacher_eu, n_cases=n_cases)
-    print(f"  {dataset_name}: {len(indices)} cases, EU range [{teacher_eu[indices].min():.4f}, {teacher_eu[indices].max():.4f}]")
+    print(f"  {dataset_name}: {len(indices)} cases, method={attribution_method}"
+          f"{f', ig_steps={ig_steps}' if attribution_method == 'ig' else ''}")
 
     ds_out = os.path.join(out_dir, dataset_name)
     os.makedirs(ds_out, exist_ok=True)
     summary_rows = []
+    use_ig = attribution_method.lower() == "ig"
+    method_label = "IG" if use_ig else "GradCAM"
 
     for idx, glob_idx in enumerate(indices):
-        x_teacher = all_images[glob_idx : glob_idx + 1].clone().to(device)
-        x_teacher.requires_grad_(True)
-        teacher_cam = compute_teacher_uncertainty_cam(members, x_teacher, device)
+        pt, ps = int(pred_teacher[glob_idx]), int(pred_student[glob_idx])
+        x = all_images[glob_idx : glob_idx + 1].clone().to(device)
 
-        x_student = all_images[glob_idx : glob_idx + 1].clone().to(device)
-        x_student.requires_grad_(True)
-        student_cam = compute_student_uncertainty_cam(student, x_student, device)
+        if use_ig:
+            teacher_cam = compute_teacher_eu_ig(members, x, device, steps=ig_steps)
+            x2 = all_images[glob_idx : glob_idx + 1].clone().to(device)
+            student_cam = compute_student_eu_ig(student, x2, device, steps=ig_steps)
+            x3 = all_images[glob_idx : glob_idx + 1].clone().to(device)
+            teacher_sal = compute_teacher_pred_ig(members, x3, pt, device, steps=ig_steps)
+            x4 = all_images[glob_idx : glob_idx + 1].clone().to(device)
+            student_sal = compute_student_pred_ig(student, x4, ps, device, steps=ig_steps)
+        else:
+            x_t = x.clone()
+            x_t.requires_grad_(True)
+            teacher_cam = compute_teacher_uncertainty_cam(members, x_t, device)
+            x_s = all_images[glob_idx : glob_idx + 1].clone().to(device)
+            x_s.requires_grad_(True)
+            student_cam = compute_student_uncertainty_cam(student, x_s, device, include_probs_path=True)
+            x_ts = all_images[glob_idx : glob_idx + 1].clone().to(device)
+            x_ts.requires_grad_(True)
+            teacher_sal = compute_teacher_prediction_saliency(members, x_ts, pt, device)
+            x_ss = all_images[glob_idx : glob_idx + 1].clone().to(device)
+            x_ss.requires_grad_(True)
+            student_sal = compute_student_prediction_saliency(student, x_ss, ps, device)
 
         orig = denormalize(all_images[glob_idx])
         fname = f"uncertainty_cam_{idx:03d}.png"
         true_str = label_str_fn(glob_idx) if label_str_fn else None
         plot_single_case(
-            orig, teacher_cam, student_cam,
+            orig, teacher_cam, student_cam, teacher_sal, student_sal,
             float(teacher_eu[glob_idx]), float(student_eu_all[glob_idx]),
-            int(pred_teacher[glob_idx]), int(student_pred_all[glob_idx]),
-            os.path.join(ds_out, fname), true_label_str=true_str,
+            pt, ps,
+            os.path.join(ds_out, fname), true_label_str=true_str, method_label=method_label,
         )
 
         true_lab = label_str_fn(glob_idx) if label_str_fn else "OOD"
@@ -334,7 +503,7 @@ def run_dataset_cam(members, student, dataset_name, all_images, teacher_eu, stud
             idx, glob_idx, f"{teacher_eu[glob_idx]:.6f}", f"{student_eu_all[glob_idx]:.6f}",
             true_lab,
             CIFAR10_CLASSES[int(pred_teacher[glob_idx])],
-            CIFAR10_CLASSES[int(student_pred_all[glob_idx])],
+            CIFAR10_CLASSES[int(pred_student[glob_idx])],
             fname,
         ])
 
@@ -362,10 +531,14 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=64,
                         help="Batch size for uncertainty computation (smaller = less GPU memory)")
+    parser.add_argument("--attribution_method", type=str, default="ig", choices=["gradcam", "ig"],
+                        help="Attribution: gradcam (fast) or ig (Integrated Gradients, better)")
+    parser.add_argument("--ig_steps", type=int, default=50, help="Integration steps for IG (higher=more accurate, slower)")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device(f"cuda:{args.gpu}" if args.gpu >= 0 and torch.cuda.is_available() else "cpu")
+    print(f"Attribution method: {args.attribution_method}" + (f" (steps={args.ig_steps})" if args.attribution_method == "ig" else ""))
 
     # Load models
     print("Loading ensemble (teacher)...")
@@ -425,6 +598,7 @@ def main():
             members, student, "id",
             all_images, teacher_eu, student_eu_all, pred_teacher, student_pred_all,
             label_fn, args.out_dir, args.n_per_dataset, device,
+            attribution_method=args.attribution_method, ig_steps=args.ig_steps,
         )
         total_saved += n
 
@@ -472,6 +646,7 @@ def main():
                 members, student, dataset_name,
                 corrupted, teacher_eu, student_eu_all, pred_teacher, student_pred_all,
                 label_fn, args.out_dir, args.n_per_dataset, device,
+                attribution_method=args.attribution_method, ig_steps=args.ig_steps,
             )
             total_saved += n
 
@@ -524,6 +699,7 @@ def main():
                 members, student, dataset_name,
                 all_images, teacher_eu, student_eu_all, pred_teacher, student_pred_all,
                 label_fn, args.out_dir, args.n_per_dataset, device,
+                attribution_method=args.attribution_method, ig_steps=args.ig_steps,
             )
             total_saved += n
 
