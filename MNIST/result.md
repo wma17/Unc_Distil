@@ -209,3 +209,11 @@ Omniglot           seen        0.9997    1.0000    0.4668
 EMNIST-Letters     unseen      0.9509    0.9638    0.9086
 CIFAR-10           unseen      1.0000    1.0000    0.0317
 SVHN               unseen      1.0000    1.0000    0.1094
+
+Dataset             Tea EU      Stu EU      SingleModel
+---------------------------------------------------------
+FashionMNIST        0.9966      0.9994      0.5716
+Omniglot            0.9997      1.0000      0.4668
+EMNIST-Letters      0.9509      0.9638      0.9086
+CIFAR-10            1.0000      1.0000      0.0317
+SVHN                1.0000      1.0000      0.1094

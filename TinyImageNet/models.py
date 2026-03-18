@@ -2,8 +2,9 @@
 DeiT-Small model definitions for LoRA ensemble and distilled student.
 
 Ensemble member:
-    Pretrained DeiT-Small (patch16, 224×224) with frozen backbone,
-    LoRA adapters injected into attention layers, and a new 200-class head.
+    Pretrained DeiT-Small (patch16, 224×224) with LoRA adapters injected
+    into attention layers, a new 200-class head, and optional partial
+    fine-tuning of the last transformer blocks.
 
 Student:
     Same DeiT-Small backbone + classification head + scalar EU head.
@@ -12,6 +13,7 @@ Student:
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import Optional
 
 import torch
@@ -19,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import timm
 
-from lora import apply_lora, lora_state_dict, load_lora_state_dict
+from lora import apply_lora, lora_state_dict
 
 EMBED_DIM = 384
 NUM_CLASSES = 200
@@ -40,12 +42,13 @@ def create_ensemble_member(
     alpha: Optional[float] = None,
     lora_dropout: float = 0.0,
     targets: str = "qkv+proj",
+    unfreeze_blocks: int = 0,
     pretrained: bool = True,
 ) -> nn.Module:
     """Create a DeiT-Small with LoRA adapters for ensemble training.
 
-    All backbone weights are frozen; only LoRA A/B and the classification
-    head are trainable.
+    Most backbone weights stay frozen. LoRA adapters are always trainable,
+    and the final `unfreeze_blocks` transformer blocks are fully fine-tuned.
     """
     model = _base_deit(pretrained=pretrained)
 
@@ -54,21 +57,52 @@ def create_ensemble_member(
 
     if alpha is None:
         alpha = float(rank)
-    lora_params = apply_lora(model, rank=rank, alpha=alpha,
-                             lora_dropout=lora_dropout, targets=targets)
+    apply_lora(model, rank=rank, alpha=alpha,
+               lora_dropout=lora_dropout, targets=targets)
 
     for p in model.head.parameters():
         p.requires_grad = True
+    if unfreeze_blocks > 0:
+        n_blocks = len(model.blocks)
+        for p in model.norm.parameters():
+            p.requires_grad = True
+        for i in range(max(0, n_blocks - unfreeze_blocks), n_blocks):
+            for p in model.blocks[i].parameters():
+                p.requires_grad = True
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"  LoRA member: {trainable:,} trainable / {total:,} total "
-          f"(rank={rank}, targets={targets})")
+          f"(rank={rank}, targets={targets}, unfreeze_blocks={unfreeze_blocks})")
     return model
 
 
+def member_state_dict(model: nn.Module) -> OrderedDict:
+    """Persist only trainable member parameters; frozen pretrained weights are implicit."""
+    keep = OrderedDict()
+    trainable_keys = {name for name, p in model.named_parameters() if p.requires_grad}
+    for key, value in model.state_dict().items():
+        if key in trainable_keys:
+            keep[key] = value
+    return keep
+
+
+def load_saved_member_state(model: nn.Module, checkpoint_or_state, strict: bool = False):
+    """Load trainable member weights from a checkpoint or raw state dict."""
+    if isinstance(checkpoint_or_state, dict) and "member_state" in checkpoint_or_state:
+        state = checkpoint_or_state["member_state"]
+    elif isinstance(checkpoint_or_state, dict) and "lora_head_state" in checkpoint_or_state:
+        state = checkpoint_or_state["lora_head_state"]
+    else:
+        state = checkpoint_or_state
+    return model.load_state_dict(state, strict=strict)
+
+
 def save_member(model: nn.Module, path: str, extra: dict | None = None):
-    data = {"lora_head_state": lora_state_dict(model, include_head=True)}
+    data = {
+        "member_state": member_state_dict(model),
+        "lora_head_state": lora_state_dict(model, include_head=True),
+    }
     if extra:
         data.update(extra)
     torch.save(data, path)
@@ -80,15 +114,16 @@ def load_member(
     alpha: Optional[float] = None,
     lora_dropout: float = 0.0,
     targets: str = "qkv+proj",
+    unfreeze_blocks: int = 0,
     device: torch.device | str = "cpu",
 ) -> nn.Module:
     """Recreate a LoRA member and load saved adapter + head weights."""
     model = create_ensemble_member(
         rank=rank, alpha=alpha, lora_dropout=lora_dropout,
-        targets=targets, pretrained=True,
+        targets=targets, unfreeze_blocks=unfreeze_blocks, pretrained=True,
     )
     ckpt = torch.load(path, map_location=device, weights_only=True)
-    load_lora_state_dict(model, ckpt["lora_head_state"], strict=False)
+    load_saved_member_state(model, ckpt, strict=False)
     model.to(device)
     model.eval()
     return model

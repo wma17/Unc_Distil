@@ -25,14 +25,16 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from data import (
     CORRUPTIONS,
+    FAKE_OOD_SEED,
     TinyImageNetDataset,
     apply_corruption,
+    build_fake_ood_datasets,
     download_tiny_imagenet,
+    generate_fake_ood_specs,
     get_ood_loaders,
     get_val_transform,
 )
-from models import create_ensemble_member
-from lora import load_lora_state_dict
+from models import create_ensemble_member, load_saved_member_state
 
 
 def load_ensemble(save_dir: str, device: torch.device):
@@ -50,10 +52,11 @@ def load_ensemble(save_dir: str, device: torch.device):
             alpha=cfg["alpha"],
             lora_dropout=cfg["lora_dropout"],
             targets=cfg["targets"],
+            unfreeze_blocks=cfg.get("unfreeze_blocks", 0),
             pretrained=True,
         )
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-        load_lora_state_dict(model, ckpt["lora_head_state"], strict=False)
+        load_saved_member_state(model, ckpt, strict=False)
         model.to(device).eval()
         members.append((cfg, model))
         print(f"  Loaded member {mid} (rank={cfg['rank']}, targets={cfg['targets']})")
@@ -119,6 +122,10 @@ def main():
     parser.add_argument("--data_dir", type=str, default="../data")
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--p2_data_mode", type=str, default="fake_ood", choices=["ood", "fake_ood"],
+                        help="Phase 2 data: 'ood'=real OOD fallback, 'fake_ood'=mixup+masked only")
+    parser.add_argument("--fake_ood_mixup_frac", type=float, default=0.5,
+                        help="Fraction of fake OOD allocated to mixup; remainder uses masking")
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
@@ -144,6 +151,7 @@ def main():
     results["train_AU"] = r["AU"]
     results["train_EU"] = r["EU"]
     print(f"  train: {len(r['labels'])} samples, EU mean={r['EU'].mean():.6f}")
+    results["p2_data_mode"] = np.array(args.p2_data_mode)
 
     # ── 2. Clean val set ──────────────────────────────────────────────────
     print("Caching: clean val ...")
@@ -172,6 +180,28 @@ def main():
         results[f"corrupt_{cname}_AU"] = r["AU"]
         results[f"corrupt_{cname}_EU"] = r["EU"]
         print(f"    {cname}: {len(r['labels'])} samples, EU mean={r['EU'].mean():.6f}")
+
+    if args.p2_data_mode == "fake_ood":
+        print("Caching: fake OOD datasets ...")
+        n_fake = len(train_ds) // 2
+        n_mixup = int(n_fake * args.fake_ood_mixup_frac)
+        n_masked = n_fake - n_mixup
+        specs = generate_fake_ood_specs(len(train_ds), n_mixup, n_masked, seed=FAKE_OOD_SEED)
+        mixup_ds, masked_ds = build_fake_ood_datasets(train_ds, specs)
+
+        mixup_loader = DataLoader(mixup_ds, batch_size=args.batch_size,
+                                  shuffle=False, num_workers=4, pin_memory=True)
+        masked_loader = DataLoader(masked_ds, batch_size=args.batch_size,
+                                   shuffle=False, num_workers=4, pin_memory=True)
+
+        r_mix = cache_from_loader(members, mixup_loader, device)
+        r_mask = cache_from_loader(members, masked_loader, device)
+        results["fake_mixup_EU"] = r_mix["EU"]
+        results["fake_masked_EU"] = r_mask["EU"]
+        results["fake_ood_mixup_frac"] = np.array(args.fake_ood_mixup_frac)
+        results.update(specs)
+        print(f"  fake mixup: {len(r_mix['EU'])} samples, EU mean={r_mix['EU'].mean():.6f}")
+        print(f"  fake masked: {len(r_mask['EU'])} samples, EU mean={r_mask['EU'].mean():.6f}")
 
     # ── 4. OOD datasets ──────────────────────────────────────────────────
     print("Caching: OOD datasets ...")

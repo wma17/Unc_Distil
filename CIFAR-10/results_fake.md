@@ -241,3 +241,13 @@ Files already downloaded and verified
   DTD              unseen      0.8696     0.8705
 Files already downloaded and verified
   Shifted CIFAR-10 shift       0.6979     0.6986
+
+
+Dataset             Tea EU      Stu EU      SingleModelEntropy
+------------------------------------------------------
+SVHN                0.9648      0.9768      0.9423
+CIFAR-100           0.9075      0.9094      0.8372
+MNIST               0.9212      0.9389      0.9039
+FashionMNIST        0.9306      0.9392      0.9145
+STL10               0.6686      0.6723      0.6337
+DTD                 0.9469      0.9428      0.8696

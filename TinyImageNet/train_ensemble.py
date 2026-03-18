@@ -2,15 +2,17 @@
 Train a diverse LoRA ensemble of DeiT-Small models on Tiny-ImageNet-200.
 
 Each member gets a stochastic combination of:
-    - LoRA rank / alpha / dropout / target layers
-    - Augmentation strategy (basic, RandAugment, AutoAugment, ColorJitter)
-    - Label smoothing ∈ [0, 0.1]
+    - Moderate-rank LoRA adapters plus light partial backbone fine-tuning
+    - Augmentation bundle with at least 3 of:
+      RandAugment, MixUp, CutMix, random erasing, color jitter
+    - Label smoothing ∈ [0.02, 0.05]
     - Data bagging (80-100 % subset)
-    - Learning rate ∈ [1e-4, 5e-4], weight decay ∈ {0.01, 0.05}
+    - Learning rate ∈ [5e-5, 2e-4], with very-low LR on unfrozen backbone
+    - Weight decay fixed at 0.05
     - LR schedule (cosine with varying warmup)
 
 Usage:
-    python train_ensemble.py --num_members 5 --epochs 30 --gpu 0
+    python train_ensemble.py --num_members 5 --epochs 80 --gpu 0
 """
 
 from __future__ import annotations
@@ -50,23 +52,64 @@ def cosine_lr(optimizer, epoch, total_epochs, warmup_epochs, base_lr):
         progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
         lr = base_lr * 0.5 * (1.0 + np.cos(np.pi * progress))
     for pg in optimizer.param_groups:
-        pg["lr"] = lr
+        pg["lr"] = lr * pg.get("lr_scale", 1.0)
     return lr
+
+
+def sample_augmentations(rng) -> list[str]:
+    """Sample at least 3 augmentations from the main training pool."""
+    pool = ["randaugment", "mixup", "cutmix", "erasing", "colorjitter"]
+    n_aug = rng.choice([3, 4, 5])
+    return rng.sample(pool, k=n_aug)
+
+
+def mixup_batch(x, y, alpha=0.2):
+    if alpha <= 0:
+        return x, y, y, 1.0
+    lam = np.random.beta(alpha, alpha)
+    lam = max(lam, 1.0 - lam)
+    idx = torch.randperm(x.size(0), device=x.device)
+    mixed_x = lam * x + (1.0 - lam) * x[idx]
+    return mixed_x, y, y[idx], lam
+
+
+def cutmix_batch(x, y, alpha=1.0):
+    if alpha <= 0:
+        return x, y, y, 1.0
+    lam = np.random.beta(alpha, alpha)
+    idx = torch.randperm(x.size(0), device=x.device)
+    _, _, h, w = x.shape
+
+    cut_ratio = np.sqrt(1.0 - lam)
+    cut_h = int(h * cut_ratio)
+    cut_w = int(w * cut_ratio)
+    cy = np.random.randint(0, h)
+    cx = np.random.randint(0, w)
+    y1 = max(0, cy - cut_h // 2)
+    y2 = min(h, cy + cut_h // 2)
+    x1 = max(0, cx - cut_w // 2)
+    x2 = min(w, cx + cut_w // 2)
+
+    mixed_x = x.clone()
+    mixed_x[:, :, y1:y2, x1:x2] = x[idx, :, y1:y2, x1:x2]
+    lam = 1.0 - (y2 - y1) * (x2 - x1) / max(1, h * w)
+    return mixed_x, y, y[idx], lam
 
 
 def sample_member_config(member_id: int, base_seed: int) -> dict:
     rng = random.Random(base_seed + member_id)
 
-    rank = rng.choice([4, 8, 16])
-    alpha = rng.choice([float(rank), float(2 * rank)])
-    lora_dropout = rng.choice([0.0, 0.05, 0.1])
-    targets = rng.choice(["qkv_only", "qkv+proj", "qkv+proj+mlp"])
+    rank = rng.choice([8, 16, 32])
+    alpha = 8.0 if rank == 8 else 16.0
+    lora_dropout = 0.1 if rank >= 32 else 0.05
+    targets = rng.choice(["qkv+proj", "qkv+proj+mlp"])
+    unfreeze_blocks = 2
 
-    aug = rng.choice(["basic", "randaugment", "autoaugment", "colorjitter"])
-    label_smooth = round(rng.uniform(0.0, 0.1), 3)
+    aug = sample_augmentations(rng)
+    label_smooth = round(rng.uniform(0.02, 0.05), 3)
     bag_frac = round(rng.uniform(0.8, 1.0), 2)
-    lr = round(rng.uniform(1e-4, 5e-4), 6)
-    wd = rng.choice([0.01, 0.05])
+    lr = round(rng.uniform(5e-5, 2e-4), 6)
+    wd = 0.05
     warmup_epochs = rng.choice([5, 10])
 
     return {
@@ -76,13 +119,40 @@ def sample_member_config(member_id: int, base_seed: int) -> dict:
         "alpha": alpha,
         "lora_dropout": lora_dropout,
         "targets": targets,
-        "augmentation": aug,
+        "unfreeze_blocks": unfreeze_blocks,
+        "augmentations": aug,
         "label_smoothing": label_smooth,
         "bag_fraction": bag_frac,
         "lr": lr,
         "weight_decay": wd,
         "warmup_epochs": warmup_epochs,
     }
+
+
+def build_param_groups(model: nn.Module, backbone_lr_factor: float):
+    """Use full LR for head/LoRA and a much lower LR for unfrozen backbone weights."""
+    fast_params = []
+    slow_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith("head.") or "lora_A" in name or "lora_B" in name:
+            fast_params.append(param)
+        else:
+            slow_params.append(param)
+
+    param_groups = []
+    if fast_params:
+        param_groups.append({"params": fast_params, "lr_scale": 1.0, "group_name": "head+lora"})
+    if slow_params:
+        param_groups.append({
+            "params": slow_params,
+            "lr_scale": backbone_lr_factor,
+            "group_name": "backbone",
+        })
+
+    return param_groups, len(fast_params), len(slow_params)
 
 
 def train_one_member(cfg: dict, args):
@@ -94,7 +164,7 @@ def train_one_member(cfg: dict, args):
 
     root = download_tiny_imagenet(args.data_dir)
 
-    train_tf = get_train_transform(cfg["augmentation"])
+    train_tf = get_train_transform(cfg["augmentations"])
     val_tf = get_val_transform()
     train_ds = TinyImageNetDataset(root, split="train", transform=train_tf)
     val_ds = TinyImageNetDataset(root, split="val", transform=val_tf)
@@ -117,32 +187,54 @@ def train_one_member(cfg: dict, args):
     model = create_ensemble_member(
         rank=cfg["rank"], alpha=cfg["alpha"],
         lora_dropout=cfg["lora_dropout"], targets=cfg["targets"],
+        unfreeze_blocks=cfg.get("unfreeze_blocks", 0),
     ).to(device)
 
+    param_groups, n_fast, n_slow = build_param_groups(model, args.backbone_lr_factor)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=cfg["lr"],
+    optimizer = torch.optim.AdamW(param_groups, lr=cfg["lr"],
                                   weight_decay=cfg["weight_decay"])
     criterion = nn.CrossEntropyLoss(label_smoothing=cfg["label_smoothing"])
     scaler = GradScaler()
+    print(f"  Optimizer groups: head+lora={n_fast} tensors @ x1.0 lr, "
+          f"backbone={n_slow} tensors @ x{args.backbone_lr_factor:.4f} lr")
+    print(f"  Augmentations: {cfg['augmentations']}")
+
+    aug_set = set(cfg["augmentations"])
+    batch_aug_ops = []
+    if "mixup" in aug_set:
+        batch_aug_ops.append("mixup")
+    if "cutmix" in aug_set:
+        batch_aug_ops.append("cutmix")
 
     best_acc = 0.0
     for epoch in range(args.epochs):
         lr = cosine_lr(optimizer, epoch, args.epochs, cfg["warmup_epochs"], cfg["lr"])
+        backbone_lr = lr * args.backbone_lr_factor if n_slow > 0 else 0.0
         model.train()
         total_loss, correct, total = 0.0, 0, 0
 
         for imgs, labels in train_loader:
             imgs, labels = imgs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+            labels_a, labels_b, lam = labels, labels, 1.0
+            if batch_aug_ops:
+                aug_name = random.choice(batch_aug_ops)
+                if aug_name == "mixup":
+                    imgs, labels_a, labels_b, lam = mixup_batch(imgs, labels, alpha=0.2)
+                else:
+                    imgs, labels_a, labels_b, lam = cutmix_batch(imgs, labels, alpha=1.0)
+
             optimizer.zero_grad(set_to_none=True)
             with autocast():
                 logits = model(imgs)
-                loss = criterion(logits, labels)
+                loss = lam * criterion(logits, labels_a) + (1.0 - lam) * criterion(logits, labels_b)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             total_loss += loss.item() * imgs.size(0)
-            correct += (logits.argmax(1) == labels).sum().item()
+            preds = logits.argmax(1)
+            correct += lam * (preds == labels_a).sum().item() + (1.0 - lam) * (preds == labels_b).sum().item()
             total += imgs.size(0)
 
         train_acc = correct / total
@@ -158,7 +250,7 @@ def train_one_member(cfg: dict, args):
                 val_total += imgs.size(0)
         val_acc = val_correct / val_total
 
-        print(f"  [{epoch+1:02d}/{args.epochs}] lr={lr:.6f}  "
+        print(f"  [{epoch+1:02d}/{args.epochs}] lr={lr:.6f}  backbone_lr={backbone_lr:.6f}  "
               f"train_loss={total_loss/total:.4f}  train_acc={train_acc:.4f}  "
               f"val_acc={val_acc:.4f}")
 
@@ -175,13 +267,15 @@ def train_one_member(cfg: dict, args):
 def main():
     parser = argparse.ArgumentParser(description="Train LoRA ViT ensemble on Tiny-ImageNet")
     parser.add_argument("--num_members", type=int, default=5)
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--data_dir", type=str, default="../data")
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
     parser.add_argument("--base_seed", type=int, default=42)
     parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--backbone_lr_factor", type=float, default=0.02,
+                        help="Multiplier for unfrozen backbone LR relative to head/LoRA LR")
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)

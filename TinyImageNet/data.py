@@ -130,35 +130,53 @@ def get_val_transform() -> transforms.Compose:
     ])
 
 
-def get_train_transform(aug_cfg: str = "basic") -> transforms.Compose:
-    """Return a training transform based on augmentation config.
+def _normalize_aug_tokens(aug_cfg) -> List[str]:
+    """Normalize a train-augmentation config into a list of tokens."""
+    if isinstance(aug_cfg, str):
+        if aug_cfg in ("", "basic"):
+            return []
+        return [tok for tok in aug_cfg.split("+") if tok and tok != "basic"]
+    if aug_cfg is None:
+        return []
+    return [str(tok) for tok in aug_cfg if str(tok) and str(tok) != "basic"]
 
-    aug_cfg options:
-        "basic"       — random crop + flip
-        "randaugment" — basic + RandAugment(2,9)
-        "autoaugment" — basic + AutoAugment(ImageNet policy)
-        "colorjitter" — basic + strong color jitter
-        "cutmix"      — (handled at batch level, use basic here)
+
+def get_train_transform(aug_cfg="basic") -> transforms.Compose:
+    """Return a training transform based on one or more augmentation tokens.
+
+    Supported tokens:
+        "randaugment" — RandAugment(2,9)
+        "autoaugment" — AutoAugment(ImageNet policy)
+        "colorjitter" — strong color jitter
+        "perspective" — random perspective warp
+        "erasing"     — random erasing after normalization
+        "mixup"       — batch-level, ignored here
+        "cutmix"      — batch-level, ignored here
     """
+    aug_tokens = _normalize_aug_tokens(aug_cfg)
+    aug_set = set(aug_tokens)
+
     base = [
         transforms.Resize(256),
         transforms.RandomCrop(224),
         transforms.RandomHorizontalFlip(),
     ]
 
-    if aug_cfg == "randaugment":
+    if "randaugment" in aug_set:
         base.append(transforms.RandAugment(num_ops=2, magnitude=9))
-    elif aug_cfg == "autoaugment":
+    elif "autoaugment" in aug_set:
         base.append(transforms.AutoAugment(transforms.AutoAugmentPolicy.IMAGENET))
-    elif aug_cfg == "colorjitter":
+    if "colorjitter" in aug_set:
         base.append(transforms.ColorJitter(0.4, 0.4, 0.4, 0.1))
+    if "perspective" in aug_set:
+        base.append(transforms.RandomPerspective(distortion_scale=0.25, p=0.4))
 
     base += [
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ]
 
-    if aug_cfg == "randaugment" or aug_cfg == "basic":
+    if "erasing" in aug_set or not aug_tokens:
         base.append(transforms.RandomErasing(p=0.25))
 
     return transforms.Compose(base)
@@ -227,6 +245,25 @@ CORRUPTIONS = {
     "shot_noise": shot_noise,
 }
 
+FAKE_OOD_SEED = 2027
+MIXUP_LAMBDAS = [0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9]
+MASK_STYLES = ["random_block", "random_pixel", "center_crop_mask", "multi_block", "border_mask"]
+MASK_RATES = [0.3, 0.5, 0.7, 0.8]
+
+
+def _denorm_imagenet(x: torch.Tensor) -> torch.Tensor:
+    shape = (1, 3, 1, 1) if x.dim() == 4 else (3, 1, 1)
+    mean = x.new_tensor(IMAGENET_MEAN).view(shape)
+    std = x.new_tensor(IMAGENET_STD).view(shape)
+    return x * std + mean
+
+
+def _renorm_imagenet(x: torch.Tensor) -> torch.Tensor:
+    shape = (1, 3, 1, 1) if x.dim() == 4 else (3, 1, 1)
+    mean = x.new_tensor(IMAGENET_MEAN).view(shape)
+    std = x.new_tensor(IMAGENET_STD).view(shape)
+    return (x - mean) / std
+
 
 def apply_corruption(dataset, corruption_fn, max_samples: int = 5000):
     """Apply a corruption to a dataset, returning (images_tensor, labels)."""
@@ -237,6 +274,158 @@ def apply_corruption(dataset, corruption_fn, max_samples: int = 5000):
         imgs.append(corruption_fn(img))
         labels.append(lbl)
     return torch.stack(imgs), torch.tensor(labels, dtype=torch.long)
+
+
+def apply_masking(images: torch.Tensor, style: str, rate: float, seed: int = FAKE_OOD_SEED) -> torch.Tensor:
+    """Mask a normalized image tensor or batch in raw pixel space."""
+    squeeze = images.dim() == 3
+    if squeeze:
+        images = images.unsqueeze(0)
+
+    raw = _denorm_imagenet(images).clamp(0, 1)
+    out = raw.clone()
+    n, _c, h, w = out.shape
+    rng = torch.Generator(device=out.device).manual_seed(seed)
+
+    if style == "random_block":
+        side = max(1, int((rate * h * w) ** 0.5))
+        for i in range(n):
+            top = int(torch.randint(0, max(1, h - side + 1), (1,), generator=rng, device=out.device).item())
+            left = int(torch.randint(0, max(1, w - side + 1), (1,), generator=rng, device=out.device).item())
+            out[i, :, top:top + side, left:left + side] = 0
+
+    elif style == "random_pixel":
+        keep = torch.rand(n, 1, h, w, generator=rng, device=out.device) > rate
+        out = out * keep.float()
+
+    elif style == "center_crop_mask":
+        side = max(1, int((rate * h * w) ** 0.5))
+        top = (h - side) // 2
+        left = (w - side) // 2
+        out[:, :, top:top + side, left:left + side] = 0
+
+    elif style == "multi_block":
+        n_blocks = max(2, int(rate * 8))
+        block_area = rate * h * w / n_blocks
+        side = max(2, int(block_area ** 0.5))
+        for i in range(n):
+            for _ in range(n_blocks):
+                top = int(torch.randint(0, max(1, h - side + 1), (1,), generator=rng, device=out.device).item())
+                left = int(torch.randint(0, max(1, w - side + 1), (1,), generator=rng, device=out.device).item())
+                out[i, :, top:top + side, left:left + side] = 0
+
+    elif style == "border_mask":
+        border = max(1, int(rate * min(h, w) / 2))
+        out[:, :, :border, :] = 0
+        out[:, :, -border:, :] = 0
+        out[:, :, :, :border] = 0
+        out[:, :, :, -border:] = 0
+
+    else:
+        raise ValueError(f"Unknown mask style: {style}")
+
+    masked = _renorm_imagenet(out)
+    return masked[0] if squeeze else masked
+
+
+def generate_fake_ood_specs(
+    num_source: int,
+    n_mixup: int,
+    n_masked: int,
+    seed: int = FAKE_OOD_SEED,
+) -> Dict[str, np.ndarray]:
+    """Generate deterministic metadata for fake OOD regeneration."""
+    rng = np.random.RandomState(seed)
+    perm = rng.permutation(num_source)
+
+    mix_a = np.empty(n_mixup, dtype=np.int64)
+    mix_b = np.empty(n_mixup, dtype=np.int64)
+    mix_lam = np.empty(n_mixup, dtype=np.float32)
+    for k in range(n_mixup):
+        mix_a[k] = int(perm[(2 * k) % num_source])
+        mix_b[k] = int(perm[(2 * k + 1) % num_source])
+        mix_lam[k] = float(MIXUP_LAMBDAS[k % len(MIXUP_LAMBDAS)])
+
+    combos = [(s_idx, rate) for s_idx in range(len(MASK_STYLES)) for rate in MASK_RATES]
+    masked_idx = rng.randint(0, num_source, size=n_masked).astype(np.int64)
+    masked_style_idx = np.empty(n_masked, dtype=np.int64)
+    masked_rates = np.empty(n_masked, dtype=np.float32)
+    for k in range(n_masked):
+        style_idx, rate = combos[k % len(combos)]
+        masked_style_idx[k] = style_idx
+        masked_rates[k] = rate
+
+    return {
+        "fake_mixup_idx_a": mix_a,
+        "fake_mixup_idx_b": mix_b,
+        "fake_mixup_lambdas": mix_lam,
+        "fake_masked_idx": masked_idx,
+        "fake_masked_style_idx": masked_style_idx,
+        "fake_masked_rates": masked_rates,
+        "fake_masked_seed_base": np.array(seed + 10000, dtype=np.int64),
+    }
+
+
+class FakeMixupDataset(Dataset):
+    """On-the-fly mixup samples defined by precomputed source indices."""
+
+    def __init__(self, base_ds: Dataset, idx_a, idx_b, lambdas):
+        self.base_ds = base_ds
+        self.idx_a = np.asarray(idx_a, dtype=np.int64)
+        self.idx_b = np.asarray(idx_b, dtype=np.int64)
+        self.lambdas = np.asarray(lambdas, dtype=np.float32)
+
+    def __len__(self):
+        return len(self.idx_a)
+
+    def __getitem__(self, idx):
+        img_a, _ = self.base_ds[int(self.idx_a[idx])]
+        img_b, _ = self.base_ds[int(self.idx_b[idx])]
+        lam = float(self.lambdas[idx])
+        raw_a = _denorm_imagenet(img_a).clamp(0, 1)
+        raw_b = _denorm_imagenet(img_b).clamp(0, 1)
+        mixed = (lam * raw_a + (1 - lam) * raw_b).clamp(0, 1)
+        return _renorm_imagenet(mixed), 0
+
+
+class FakeMaskedDataset(Dataset):
+    """On-the-fly masked samples defined by precomputed source indices."""
+
+    def __init__(self, base_ds: Dataset, idxs, style_idxs, rates, seed_base: int):
+        self.base_ds = base_ds
+        self.idxs = np.asarray(idxs, dtype=np.int64)
+        self.style_idxs = np.asarray(style_idxs, dtype=np.int64)
+        self.rates = np.asarray(rates, dtype=np.float32)
+        self.seed_base = int(seed_base)
+
+    def __len__(self):
+        return len(self.idxs)
+
+    def __getitem__(self, idx):
+        img, _ = self.base_ds[int(self.idxs[idx])]
+        style = MASK_STYLES[int(self.style_idxs[idx])]
+        rate = float(self.rates[idx])
+        masked = apply_masking(img, style, rate, seed=self.seed_base + int(idx))
+        return masked, 0
+
+
+def build_fake_ood_datasets(base_ds: Dataset, specs: Dict[str, np.ndarray]):
+    """Rebuild fake OOD datasets from cached metadata."""
+    mixup_ds = FakeMixupDataset(
+        base_ds,
+        specs["fake_mixup_idx_a"],
+        specs["fake_mixup_idx_b"],
+        specs["fake_mixup_lambdas"],
+    )
+    seed_base = int(np.asarray(specs["fake_masked_seed_base"]).reshape(-1)[0])
+    masked_ds = FakeMaskedDataset(
+        base_ds,
+        specs["fake_masked_idx"],
+        specs["fake_masked_style_idx"],
+        specs["fake_masked_rates"],
+        seed_base=seed_base,
+    )
+    return mixup_ds, masked_ds
 
 
 # ═══════════════════════════════════════════════════════════════════════════

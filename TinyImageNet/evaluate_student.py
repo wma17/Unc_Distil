@@ -29,8 +29,7 @@ from data import (
     get_ood_loaders,
     get_val_transform,
 )
-from models import create_student, create_ensemble_member, NUM_CLASSES
-from lora import load_lora_state_dict
+from models import create_student, create_ensemble_member, load_saved_member_state, NUM_CLASSES
 
 SEEN_OOD = {"SVHN", "CIFAR_100"}
 UNSEEN_OOD = {"CIFAR_10", "LSUN", "iSUN", "Places365", "STL10", "DTD",
@@ -325,12 +324,13 @@ def main():
         member0 = create_ensemble_member(
             rank=cfg0["rank"], alpha=cfg0["alpha"],
             lora_dropout=cfg0["lora_dropout"], targets=cfg0["targets"],
+            unfreeze_blocks=cfg0.get("unfreeze_blocks", 0),
         )
         ckpt0 = torch.load(
             os.path.join(args.save_dir, f"member_{cfg0['member_id']}.pt"),
             map_location=device, weights_only=True,
         )
-        load_lora_state_dict(member0, ckpt0["lora_head_state"], strict=False)
+        load_saved_member_state(member0, ckpt0, strict=False)
         member0.to(device).eval()
         m_probs, _ = predict_member(member0, val_loader, device)
         m_ent = entropy(m_probs)

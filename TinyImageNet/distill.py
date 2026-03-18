@@ -32,6 +32,7 @@ from torch.utils.data import DataLoader, Subset, TensorDataset, ConcatDataset
 
 from data import (
     CORRUPTIONS,
+    build_fake_ood_datasets,
     TinyImageNetDataset,
     download_tiny_imagenet,
     get_ood_loaders,
@@ -182,8 +183,10 @@ def run_phase1(model, targets, train_ds, val_ds, args, device):
     print("Phase 1: Classification Knowledge Distillation")
     print(f"  Partial freeze: last {args.p1_unfreeze_blocks} blocks + norm + head")
     print(f"  LLRD factor: {args.llrd}  |  base_lr: {args.p1_lr}")
-    print(f"  Strategies: MixUp/CutMix, DropPath=0.1, LabelSmooth=0.1, "
-          f"GradClip=1.0, EMA=0.999")
+    print(f"  Augmentations: {args.p1_augmentations}")
+    print(f"  Strategies: MixUp(alpha={args.mixup_alpha}) / CutMix(alpha={args.cutmix_alpha}), "
+          f"DropPath=0.1, LabelSmooth={args.p1_label_smoothing}, "
+          f"GradClip={args.grad_clip}, EMA={args.ema_decay}")
     print("=" * 60)
 
     n_blocks = len(model.blocks)
@@ -223,7 +226,7 @@ def run_phase1(model, targets, train_ds, val_ds, args, device):
         model, args.p1_lr, args.p1_wd, args.p1_unfreeze_blocks, args.llrd)
     optimizer = torch.optim.AdamW(param_groups, weight_decay=args.p1_wd)
     scaler = GradScaler()
-    ema = EMA(model, decay=0.999)
+    ema = EMA(model, decay=args.ema_decay)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     alpha = args.alpha
@@ -248,16 +251,16 @@ def run_phase1(model, targets, train_ds, val_ds, args, device):
             use_cutmix = np.random.rand() < 0.5
             if use_cutmix:
                 imgs, (labels_a, labels_b), (tp_a, tp_b), lam = cutmix_data(
-                    imgs, labels, t_probs, alpha=1.0)
+                    imgs, labels, t_probs, alpha=args.cutmix_alpha)
             else:
                 imgs, (labels_a, labels_b), (tp_a, tp_b), lam = mixup_data(
-                    imgs, labels, t_probs, alpha=0.2)
+                    imgs, labels, t_probs, alpha=args.mixup_alpha)
 
             optimizer.zero_grad(set_to_none=True)
             with autocast():
                 logits, _ = model(imgs)
-                ce_a = F.cross_entropy(logits, labels_a, label_smoothing=0.1)
-                ce_b = F.cross_entropy(logits, labels_b, label_smoothing=0.1)
+                ce_a = F.cross_entropy(logits, labels_a, label_smoothing=args.p1_label_smoothing)
+                ce_b = F.cross_entropy(logits, labels_b, label_smoothing=args.p1_label_smoothing)
                 ce_loss = lam * ce_a + (1 - lam) * ce_b
 
                 log_s = F.log_softmax(logits / tau, dim=-1)
@@ -271,7 +274,7 @@ def run_phase1(model, targets, train_ds, val_ds, args, device):
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
             ema.update(model)
@@ -334,29 +337,34 @@ def _extract_eu_inputs(model, loader, device):
 
 
 def _build_p2_loaders(targets, train_ds, val_ds, args):
-    """Build data loaders for Phase 2 sources (images only, no storage)."""
-    val_tf = get_val_transform()
+    """Build data loaders for Phase 2 using a 50/25/25 clean/shifted/fake-OOD mix."""
+    root = download_tiny_imagenet(args.data_dir)
     loaders = []
+    rng = np.random.RandomState(2026)
 
     clean_eu = targets["train_EU"]
     n_clean = min(len(clean_eu), 30000)
-    indices = np.random.permutation(len(clean_eu))[:n_clean]
+    n_shifted = n_clean // 2
+    n_ood = n_clean // 2
+    indices = rng.choice(len(clean_eu), size=n_clean, replace=False)
     clean_sub = Subset(train_ds, indices.tolist())
     loaders.append(("clean", DataLoader(clean_sub, batch_size=64,
                                         num_workers=args.workers, pin_memory=True),
                      clean_eu[indices]))
     print(f"  Phase 2 data — clean: {n_clean}")
 
-    per_corrupt = (n_clean // 2) // max(len(CORRUPTIONS), 1)
+    per_corrupt = max(1, n_shifted // max(len(CORRUPTIONS), 1))
+    corrupt_base = TinyImageNetDataset(root, split="val", transform=get_val_transform())
     for cname in CORRUPTIONS:
         key = f"corrupt_{cname}_EU"
         if key not in targets:
             continue
         c_eu = targets[key]
         n = min(per_corrupt, len(c_eu))
+        if n < 1:
+            continue
         c_imgs, _ = apply_corruption(
-            TinyImageNetDataset(download_tiny_imagenet(args.data_dir),
-                                split="val", transform=val_tf),
+            corrupt_base,
             CORRUPTIONS[cname], max_samples=n,
         )
         c_ds = TensorDataset(c_imgs[:n])
@@ -364,25 +372,60 @@ def _build_p2_loaders(targets, train_ds, val_ds, args):
                          c_eu[:n]))
         print(f"  Phase 2 data — {cname}: {n}")
 
-    ood_loaders = get_ood_loaders(args.data_dir, batch_size=64,
-                                  max_samples=n_clean // 4)
-    for name, loader in ood_loaders.items():
-        safe = name.replace("-", "_").replace(" ", "_")
-        key = f"ood_{safe}_EU"
-        if key not in targets:
-            continue
-        ood_eu = targets[key]
-        ood_imgs = []
-        for bi, *_ in loader:
-            ood_imgs.append(bi)
-        ood_t = torch.cat(ood_imgs)
-        n = min(len(ood_t), len(ood_eu))
-        ood_ds = TensorDataset(ood_t[:n])
-        loaders.append((f"OOD {name}",
-                         DataLoader(ood_ds, batch_size=64, num_workers=0),
-                         ood_eu[:n]))
-        print(f"  Phase 2 data — OOD {name}: {n}")
-        del ood_t
+    p2_mode = targets.get("p2_data_mode", np.array("fake_ood"))
+    if hasattr(p2_mode, "flat"):
+        p2_mode = str(p2_mode.flat[0]) if p2_mode.size else "fake_ood"
+    else:
+        p2_mode = str(p2_mode)
+
+    fake_keys = {
+        "fake_mixup_idx_a", "fake_mixup_idx_b", "fake_mixup_lambdas",
+        "fake_masked_idx", "fake_masked_style_idx", "fake_masked_rates",
+        "fake_masked_seed_base", "fake_mixup_EU", "fake_masked_EU",
+    }
+    if p2_mode == "fake_ood" and fake_keys.issubset(set(targets.keys())):
+        mixup_frac_arr = targets.get("fake_ood_mixup_frac", np.array(0.5))
+        mixup_frac = float(mixup_frac_arr.flat[0]) if hasattr(mixup_frac_arr, "flat") and mixup_frac_arr.size else 0.5
+        n_mixup_target = min(int(n_ood * mixup_frac), len(targets["fake_mixup_EU"]))
+        n_masked_target = min(n_ood - n_mixup_target, len(targets["fake_masked_EU"]))
+
+        specs = {key: targets[key] for key in fake_keys if key in targets}
+        mixup_all, masked_all = build_fake_ood_datasets(train_ds, specs)
+
+        idx_m = rng.choice(len(targets["fake_mixup_EU"]), size=n_mixup_target, replace=False) if n_mixup_target > 0 else np.empty(0, dtype=np.int64)
+        idx_k = rng.choice(len(targets["fake_masked_EU"]), size=n_masked_target, replace=False) if n_masked_target > 0 else np.empty(0, dtype=np.int64)
+
+        loaders.append(("fake mixup",
+                        DataLoader(Subset(mixup_all, idx_m.tolist()), batch_size=64,
+                                   num_workers=args.workers, pin_memory=True),
+                        targets["fake_mixup_EU"][idx_m]))
+        loaders.append(("fake masked",
+                        DataLoader(Subset(masked_all, idx_k.tolist()), batch_size=64,
+                                   num_workers=args.workers, pin_memory=True),
+                        targets["fake_masked_EU"][idx_k]))
+        print(f"  Phase 2 data — fake mixup: {len(idx_m)}")
+        print(f"  Phase 2 data — fake masked: {len(idx_k)}")
+    else:
+        ood_loaders = get_ood_loaders(args.data_dir, batch_size=64, max_samples=max(1, n_ood // 2))
+        fallback = [("SVHN", n_ood // 2), ("CIFAR-100", n_ood - (n_ood // 2))]
+        for name, target_n in fallback:
+            loader = ood_loaders.get(name)
+            safe = name.replace("-", "_").replace(" ", "_")
+            key = f"ood_{safe}_EU"
+            if loader is None or key not in targets or target_n < 1:
+                continue
+            ood_eu = targets[key]
+            ood_imgs = []
+            for batch in loader:
+                ood_imgs.append(batch[0])
+            ood_t = torch.cat(ood_imgs)
+            n = min(target_n, len(ood_t), len(ood_eu))
+            ood_ds = TensorDataset(ood_t[:n])
+            loaders.append((f"OOD {name}",
+                            DataLoader(ood_ds, batch_size=64, num_workers=0),
+                            ood_eu[:n]))
+            print(f"  Phase 2 data — OOD {name}: {n}")
+            del ood_t
 
     return loaders
 
@@ -502,10 +545,17 @@ def main():
     parser.add_argument("--p1_lr", type=float, default=1e-4)
     parser.add_argument("--p1_wd", type=float, default=0.05)
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--p1_unfreeze_blocks", type=int, default=12,
+    parser.add_argument("--p1_unfreeze_blocks", type=int, default=2,
                         help="Number of last transformer blocks to unfreeze in Phase 1")
     parser.add_argument("--llrd", type=float, default=0.75,
                         help="Layer-wise learning rate decay factor")
+    parser.add_argument("--p1_augmentations", type=str, default="randaugment+colorjitter+erasing",
+                        help="Image-level augmentations for Phase 1 student KD")
+    parser.add_argument("--p1_label_smoothing", type=float, default=0.05)
+    parser.add_argument("--mixup_alpha", type=float, default=0.2)
+    parser.add_argument("--cutmix_alpha", type=float, default=1.0)
+    parser.add_argument("--ema_decay", type=float, default=0.999)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--alpha", type=float, default=0.7)
     parser.add_argument("--tau", type=float, default=2.0)
 
@@ -525,7 +575,11 @@ def main():
 
     model = create_student().to(device)
 
-    train_ds = TinyImageNetDataset(root, split="train", transform=get_train_transform("randaugment"))
+    train_ds = TinyImageNetDataset(
+        root,
+        split="train",
+        transform=get_train_transform(args.p1_augmentations),
+    )
     val_ds = TinyImageNetDataset(root, split="val", transform=val_tf)
 
     if not args.phase2_only:

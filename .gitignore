@@ -4,6 +4,10 @@ data/
 # Model checkpoints and cached targets (large binary files)
 **/checkpoints/*.pt
 **/checkpoints/*.npz
+**/checkpoints/*.pth
+**/checkpoints*/*.pt
+**/checkpoints*/*.npz
+**/checkpoints*/*.pth
 
 # Python
 __pycache__/

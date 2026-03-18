@@ -200,50 +200,76 @@ def build_phase2_datasets(args, data):
 
     train_mnist = datasets.MNIST(root=args.data_dir, train=True, download=False, transform=clean_transform)
     clean_imgs, _ = _load_tensor_dataset(train_mnist)
-    clean_train_ds = EUOnlyDataset(clean_imgs, data["train_eu"])
+    rng = np.random.RandomState(CORRUPTION_SEED)
+
+    n_clean = len(clean_imgs)
+    n_id = n_clean
+    n_shifted = n_clean // 2
+    n_ood = n_clean // 2
+
+    idx_id = rng.choice(n_clean, size=n_id, replace=False)
+    clean_train_ds = EUOnlyDataset(clean_imgs[idx_id], data["train_eu"][idx_id])
+    print(f"  ID (clean): {len(idx_id)} samples, EU mean={data['train_eu'][idx_id].mean():.4f}")
 
     # Corrupted MNIST train
     corrupt_datasets = []
-    n_per_corruption = len(clean_imgs) // (2 * len(CORRUPTION_TYPES))
+    n_per_corruption = max(1, n_shifted // max(len(CORRUPTION_TYPES), 1))
     for ctype in CORRUPTION_TYPES:
         key = f"corrupt_{ctype}_eu"
         if key not in data:
             continue
         corrupted_imgs = apply_corruption(clean_imgs, ctype, seed=CORRUPTION_SEED)
         eu = data[key]
-        rng = np.random.RandomState(CORRUPTION_SEED)
         idx = rng.choice(len(eu), size=min(n_per_corruption, len(eu)), replace=False)
         corrupt_datasets.append(EUOnlyDataset(corrupted_imgs[idx], eu[idx]))
         print(f"  Corrupted {ctype}: {len(idx)} samples, EU mean={eu[idx].mean():.4f}")
 
-    # Seen OOD: FashionMNIST
     ood_datasets = []
-    n_ood_target = len(clean_imgs) // 4
-    if "fashionmnist_eu" in data:
-        fmnist_set = datasets.FashionMNIST(root=args.data_dir, train=False,
-                                            download=False, transform=ood_transform)
-        fmnist_imgs, _ = _load_tensor_dataset(fmnist_set)
-        fmnist_eu = data["fashionmnist_eu"]
-        n_f = min(n_ood_target // 2, len(fmnist_eu))
-        rng = np.random.RandomState(CORRUPTION_SEED + 1)
-        idx = rng.choice(len(fmnist_eu), size=n_f, replace=False)
-        ood_datasets.append(EUOnlyDataset(fmnist_imgs[idx], fmnist_eu[idx]))
-        print(f"  FashionMNIST OOD: {n_f} samples, EU mean={fmnist_eu[idx].mean():.4f}")
+    p2_mode = data.get("p2_data_mode", np.array("fake_ood"))
+    if hasattr(p2_mode, "flat"):
+        p2_mode = str(p2_mode.flat[0]) if p2_mode.size else "fake_ood"
+    else:
+        p2_mode = str(p2_mode)
 
-    # Seen OOD: Omniglot
-    if "omniglot_eu" in data:
-        try:
-            omniglot_set = datasets.Omniglot(root=args.data_dir, background=False,
-                                              download=False, transform=ood_transform)
-            omni_imgs, _ = _load_tensor_dataset(omniglot_set)
-            omni_eu = data["omniglot_eu"]
-            n_k = min(n_ood_target // 2, len(omni_eu))
-            rng = np.random.RandomState(CORRUPTION_SEED + 2)
-            idx = rng.choice(len(omni_eu), size=n_k, replace=False)
-            ood_datasets.append(EUOnlyDataset(omni_imgs[idx], omni_eu[idx]))
-            print(f"  Omniglot OOD: {n_k} samples, EU mean={omni_eu[idx].mean():.4f}")
-        except Exception as e:
-            print(f"  Omniglot skipped: {e}")
+    if p2_mode == "fake_ood" and "fake_mixup_eu" in data and "fake_masked_eu" in data:
+        mixup_imgs = torch.from_numpy(data["fake_mixup_imgs"]).float()
+        mixup_eu = data["fake_mixup_eu"]
+        masked_imgs = torch.from_numpy(data["fake_masked_imgs"]).float()
+        masked_eu = data["fake_masked_eu"]
+        mf = data.get("fake_ood_mixup_frac", np.array(0.5))
+        mixup_frac = float(mf.flat[0]) if hasattr(mf, "flat") and mf.size else 0.5
+
+        n_mixup_target = min(int(n_ood * mixup_frac), len(mixup_eu))
+        n_masked_target = min(n_ood - n_mixup_target, len(masked_eu))
+
+        idx_m = rng.choice(len(mixup_eu), size=n_mixup_target, replace=False) if n_mixup_target > 0 else np.empty(0, dtype=np.int64)
+        idx_k = rng.choice(len(masked_eu), size=n_masked_target, replace=False) if n_masked_target > 0 else np.empty(0, dtype=np.int64)
+        ood_datasets.append(EUOnlyDataset(mixup_imgs[idx_m], mixup_eu[idx_m]))
+        ood_datasets.append(EUOnlyDataset(masked_imgs[idx_k], masked_eu[idx_k]))
+        print(f"  Fake OOD: mixup={len(idx_m)}, masked={len(idx_k)}")
+    else:
+        if "fashionmnist_eu" in data:
+            fmnist_set = datasets.FashionMNIST(root=args.data_dir, train=False,
+                                               download=False, transform=ood_transform)
+            fmnist_imgs, _ = _load_tensor_dataset(fmnist_set)
+            fmnist_eu = data["fashionmnist_eu"]
+            n_f = min(n_ood // 2, len(fmnist_eu))
+            idx = rng.choice(len(fmnist_eu), size=n_f, replace=False)
+            ood_datasets.append(EUOnlyDataset(fmnist_imgs[idx], fmnist_eu[idx]))
+            print(f"  FashionMNIST OOD: {n_f} samples, EU mean={fmnist_eu[idx].mean():.4f}")
+
+        if "omniglot_eu" in data:
+            try:
+                omniglot_set = datasets.Omniglot(root=args.data_dir, background=False,
+                                                 download=False, transform=ood_transform)
+                omni_imgs, _ = _load_tensor_dataset(omniglot_set)
+                omni_eu = data["omniglot_eu"]
+                n_k = min(n_ood - sum(len(d) for d in ood_datasets), len(omni_eu))
+                idx = rng.choice(len(omni_eu), size=n_k, replace=False)
+                ood_datasets.append(EUOnlyDataset(omni_imgs[idx], omni_eu[idx]))
+                print(f"  Omniglot OOD: {n_k} samples, EU mean={omni_eu[idx].mean():.4f}")
+            except Exception as e:
+                print(f"  Omniglot skipped: {e}")
 
     all_train_parts = [clean_train_ds] + corrupt_datasets + ood_datasets
     train_dataset = ConcatDataset(all_train_parts)
