@@ -223,12 +223,20 @@ def main():
                         help="Phase 2 data: 'ood'=real OOD (SVHN,CIFAR-100), 'fake_ood'=mixup+masked only")
     parser.add_argument("--fake_ood_mixup_frac", type=float, default=0.5,
                         help="Of the 25%% fake OOD, fraction from mixup (rest from masked). Default 0.5 = 12.5%% each")
+    parser.add_argument("--subset_size", type=int, default=None,
+                        help="Ablation C: use only the first K ensemble members when computing targets. "
+                             "Default=None uses all members found in save_dir.")
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.gpu}" if args.gpu >= 0 and torch.cuda.is_available() else "cpu")
 
     print("Loading ensemble...")
     members = load_ensemble(args.save_dir, device)
+    if args.subset_size is not None:
+        if args.subset_size < 1 or args.subset_size > len(members):
+            raise ValueError(f"--subset_size={args.subset_size} out of range [1, {len(members)}]")
+        members = members[:args.subset_size]
+        print(f"Ablation C: using subset of K={args.subset_size} members")
 
     clean_transform = transforms.Compose([
         transforms.ToTensor(),

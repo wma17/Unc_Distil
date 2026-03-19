@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 
 import numpy as np
 import torch
@@ -30,6 +31,77 @@ from data import (
     get_val_transform,
 )
 from models import create_student, create_ensemble_member, load_saved_member_state, NUM_CLASSES
+
+EPS_CAL = 1e-10
+
+
+def compute_ece(probs_np, labels_np, n_bins=15):
+    """15-bin Expected Calibration Error."""
+    confidences = probs_np.max(axis=-1)
+    predictions = probs_np.argmax(axis=-1)
+    accuracies = (predictions == labels_np).astype(float)
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        in_bin = (confidences > lo) & (confidences <= hi)
+        if in_bin.sum() > 0:
+            ece += (in_bin.sum() / len(labels_np)) * abs(
+                accuracies[in_bin].mean() - confidences[in_bin].mean()
+            )
+    return ece
+
+
+def compute_nll(probs_np, labels_np):
+    """Mean negative log-likelihood."""
+    n = len(labels_np)
+    return -np.log(probs_np[np.arange(n), labels_np] + EPS_CAL).mean()
+
+
+def compute_brier(probs_np, labels_np):
+    """Mean Brier score (sum of squared differences from one-hot)."""
+    n = len(labels_np)
+    one_hot = np.zeros_like(probs_np)
+    one_hot[np.arange(n), labels_np] = 1.0
+    return ((probs_np - one_hot) ** 2).sum(axis=-1).mean()
+
+
+def compute_aurc(errors_np, scores_np):
+    """AURC: sort by scores ascending (low score = most certain = included first).
+
+    Returns (aurc, oracle_aurc, oracle_gap, acc_at_90, acc_at_80).
+    Lower AURC is better.
+    """
+    n = len(errors_np)
+    order = np.argsort(scores_np)
+    sorted_errors = errors_np[order]
+    coverages = np.arange(1, n + 1) / n
+    risks = np.cumsum(sorted_errors) / np.arange(1, n + 1)
+    aurc = float(np.trapz(risks, coverages))
+    oracle_risks = np.cumsum(errors_np[np.argsort(errors_np)]) / np.arange(1, n + 1)
+    oracle_aurc = float(np.trapz(oracle_risks, coverages))
+    k90 = max(1, int(0.9 * n))
+    k80 = max(1, int(0.8 * n))
+    acc_at_90 = 1.0 - sorted_errors[:k90].mean()
+    acc_at_80 = 1.0 - sorted_errors[:k80].mean()
+    return aurc, oracle_aurc, aurc - oracle_aurc, acc_at_90, acc_at_80
+
+
+@torch.no_grad()
+def measure_throughput(fn, img_shape, device, batch_size=256, n_batches=100, n_warmup=10):
+    """Measure forward-pass throughput in samples/sec."""
+    dummy = torch.randn(batch_size, *img_shape, device=device)
+    for _ in range(n_warmup):
+        fn(dummy)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(n_batches):
+        fn(dummy)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    return (batch_size * n_batches) / (time.time() - t0)
+
 
 SEEN_OOD = {"SVHN", "CIFAR_100"}
 UNSEEN_OOD = {"CIFAR_10", "LSUN", "iSUN", "Places365", "STL10", "DTD",
@@ -135,6 +207,23 @@ def main():
 
     w(f"  Teacher (ensemble):  {t_acc*100:.2f}%")
     w(f"  Student (distilled): {s_acc*100:.2f}%")
+
+    # ── 1b. Calibration Metrics ──
+    sec("1b. Calibration Metrics (ECE-15, NLL, Brier)", out)
+    print(f"\n{'='*60}\n  1b. Calibration Metrics\n{'='*60}")
+
+    labels_np = targets["val_labels"].astype(int)
+    stu_ece = compute_ece(s_probs, labels_np)
+    stu_nll = compute_nll(s_probs, labels_np)
+    stu_brier = compute_brier(s_probs, labels_np)
+    tea_ece = compute_ece(t_probs_val, labels_np)
+    tea_nll = compute_nll(t_probs_val, labels_np)
+    tea_brier = compute_brier(t_probs_val, labels_np)
+
+    w(f"  {'Model':<30} {'ECE-15':>10} {'NLL':>10} {'Brier':>10}")
+    w(f"  {'-'*60}")
+    w(f"  {'Teacher (ensemble)':<30} {tea_ece:>10.4f} {tea_nll:>10.4f} {tea_brier:>10.4f}")
+    w(f"  {'Student (distilled)':<30} {stu_ece:>10.4f} {stu_nll:>10.4f} {stu_brier:>10.4f}")
 
     # ── 2. Correctness Agreement ──
     sec("2. Correctness Agreement", out)
@@ -392,6 +481,91 @@ def main():
                 w(f"  {name:<16} {typ:<8} {'N/A':>10} {'N/A':>10}")
     else:
         w("  [skip] no single member available")
+
+    # ── 8. Selective Prediction (AURC) ──
+    sec("8. Selective Prediction (AURC)", out)
+    print(f"\n{'='*60}\n  8. Selective Prediction (AURC)\n{'='*60}")
+
+    errors_val = (s_preds != labels_np).astype(float)
+    stu_ent_sel = entropy(s_probs)
+    stu_mp_sel = 1.0 - s_probs.max(axis=-1)
+    t_eu_val_sel = targets["val_EU"][:len(s_eu)]
+
+    aurc_rows = [
+        ("Teacher EU",        t_eu_val_sel),
+        ("Student EU (ours)", s_eu),
+        ("Student entropy",   stu_ent_sel),
+        ("1 - MaxProb",       stu_mp_sel),
+        ("Oracle",            errors_val),
+    ]
+    random_aurc_val = errors_val.mean()
+
+    w(f"  {'Method':<30} {'AURC↓':>10} {'OracleGap↓':>12} {'@90%cov↑':>10} {'@80%cov↑':>10}")
+    w(f"  {'-'*74}")
+    for row_name, scores in aurc_rows:
+        a, oa, gap, a90, a80 = compute_aurc(errors_val, scores[:len(errors_val)])
+        w(f"  {row_name:<30} {a:>10.6f} {gap:>12.6f} {a90:>10.4f} {a80:>10.4f}")
+    w(f"  {'Random (baseline)':<30} {random_aurc_val:>10.6f} {'—':>12} {'—':>10} {'—':>10}")
+
+    # ── 9. Inference Throughput ──
+    sec("9. Inference Throughput", out)
+    print(f"\n{'='*60}\n  9. Inference Throughput\n{'='*60}")
+
+    img_shape = (3, 64, 64)
+    model.eval()
+
+    def _stu_fn(x):
+        with autocast("cuda"):
+            return model(x)
+
+    stu_tp = measure_throughput(_stu_fn, img_shape, device)
+
+    w(f"  {'Model':<38} {'Samples/sec':>14} {'Speedup vs ens':>16}")
+    w(f"  {'-'*70}")
+
+    if member0 is not None:
+        def _sgl_fn(x):
+            with autocast("cuda"):
+                return member0(x)
+        sgl_tp = measure_throughput(_sgl_fn, img_shape, device)
+
+        # Load all available ensemble members for accurate ensemble throughput
+        all_members = [member0]
+        try:
+            cfg_path = os.path.join(args.save_dir, "ensemble_configs.json")
+            with open(cfg_path) as f:
+                configs = json.load(f)
+            for cfg in configs[1:]:
+                m = create_ensemble_member(
+                    rank=cfg["rank"], alpha=cfg["alpha"],
+                    lora_dropout=cfg["lora_dropout"], targets=cfg["targets"],
+                    unfreeze_blocks=cfg.get("unfreeze_blocks", 0),
+                )
+                mckpt = torch.load(
+                    os.path.join(args.save_dir, f"member_{cfg['member_id']}.pt"),
+                    map_location=device, weights_only=True,
+                )
+                load_saved_member_state(m, mckpt, strict=False)
+                m.to(device).eval()
+                all_members.append(m)
+        except Exception as e:
+            w(f"  [note] could not load full ensemble for throughput: {e}")
+
+        K = len(all_members)
+
+        def _ens_fn(x):
+            ps = []
+            for m in all_members:
+                with autocast("cuda"):
+                    ps.append(F.softmax(m(x).float(), dim=-1))
+            return torch.stack(ps, 0).mean(0)
+
+        ens_tp = measure_throughput(_ens_fn, img_shape, device)
+        w(f"  {'Ensemble (K='+str(K)+', sequential)':<38} {ens_tp:>14,.0f} {'1.00x':>16}")
+        w(f"  {'Single member':<38} {sgl_tp:>14,.0f} {sgl_tp/ens_tp:>15.2f}x")
+        w(f"  {'Student (single pass)':<38} {stu_tp:>14,.0f} {stu_tp/ens_tp:>15.2f}x")
+    else:
+        w(f"  {'Student (single pass)':<38} {stu_tp:>14,.0f} {'(no members found)':>16}")
 
     w(f"\n{'='*60}")
     w("Evaluation complete.")

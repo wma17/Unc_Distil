@@ -138,6 +138,11 @@ def eval_phase1(model, loader, alpha, tau, device):
 # Phase 2: EU head training (backbone frozen, mixed data)
 # ---------------------------------------------------------------------------
 
+def plain_mse_loss(pred, target):
+    """Standard MSE without log transform (Ablation B1)."""
+    return F.mse_loss(pred, target)
+
+
 def log1p_mse_loss(pred, target):
     """MSE in log(1+x) space — compresses long tail, preserves ranking.
 
@@ -183,16 +188,29 @@ def set_phase2_mode(model):
     model.eu_fc2.train()
 
 
-def train_phase2_epoch(model, loader, optimizer, rank_weight, device):
+def train_phase2_epoch(model, loader, optimizer, rank_weight, device, loss_mode="combined"):
     set_phase2_mode(model)
     sum_mse, sum_rank, total = 0, 0, 0
     for imgs, t_eu in loader:
         imgs, t_eu = imgs.to(device), t_eu.to(device)
         optimizer.zero_grad()
         _logits, eu_pred = model(imgs)
-        l_mse = log1p_mse_loss(eu_pred, t_eu)
-        l_rank = pairwise_ranking_loss(eu_pred, t_eu)
-        loss = l_mse + rank_weight * l_rank
+        if loss_mode == "mse":
+            l_mse = plain_mse_loss(eu_pred, t_eu)
+            l_rank = eu_pred.new_tensor(0.0)
+            loss = l_mse
+        elif loss_mode == "log_mse":
+            l_mse = log1p_mse_loss(eu_pred, t_eu)
+            l_rank = eu_pred.new_tensor(0.0)
+            loss = l_mse
+        elif loss_mode == "ranking":
+            l_mse = eu_pred.new_tensor(0.0)
+            l_rank = pairwise_ranking_loss(eu_pred, t_eu)
+            loss = l_rank
+        else:  # combined (default)
+            l_mse = log1p_mse_loss(eu_pred, t_eu)
+            l_rank = pairwise_ranking_loss(eu_pred, t_eu)
+            loss = l_mse + rank_weight * l_rank
         loss.backward()
         optimizer.step()
         bs = imgs.size(0)
@@ -226,8 +244,12 @@ def eval_phase2(model, loader, device):
 # Phase 2 mixed dataset builder
 # ---------------------------------------------------------------------------
 
-def build_phase2_datasets(args, data):
-    """Build mixed training dataset: 50% ID + 25% shifted ID + 25% (OOD or fake OOD).
+def build_phase2_datasets(args, data, curriculum="A3"):
+    """Build mixed training dataset according to curriculum.
+
+    A1: clean ID only (100%)
+    A2: 67% clean ID + 33% corrupted (no OOD tier)
+    A3: 50% clean ID + 25% corrupted + 25% OOD or fake OOD (default)
 
     Returns (train_dataset, test_dataset) where each yields (image, eu_target).
     """
@@ -246,32 +268,48 @@ def build_phase2_datasets(args, data):
     clean_imgs, _ = _load_tensor_dataset(train_cifar)
     n_clean = len(clean_imgs)
 
-    # Target sizes: 50% ID=50k, 25% shifted=25k, 25% fake/real OOD=25k (total 100k)
-    n_id = n_clean          # 50000, use all clean
-    n_shifted = n_clean // 2   # 25000
-    n_ood = n_clean // 2       # 25000
+    # Target sizes depend on curriculum
+    # A3 (default): 50% ID + 25% shifted + 25% OOD
+    # A2:           67% ID + 33% shifted (no OOD)
+    # A1:           100% ID (no shifted, no OOD)
     rng = np.random.RandomState(CORRUPTION_SEED)
 
-    # --- ID: subsample clean ---
+    if curriculum == "A1":
+        n_id = n_clean
+        n_shifted = 0
+        n_ood = 0
+    elif curriculum == "A2":
+        n_id = n_clean
+        n_shifted = n_clean // 2
+        n_ood = 0
+    else:  # A3
+        n_id = n_clean          # 50000
+        n_shifted = n_clean // 2   # 25000
+        n_ood = n_clean // 2       # 25000
+
+    # --- ID: clean ---
     idx_id = rng.choice(n_clean, size=n_id, replace=False)
     clean_train_ds = EUOnlyDataset(clean_imgs[idx_id], data["train_eu"][idx_id])
     print(f"  ID (clean): {n_id} samples, EU mean={data['train_eu'][idx_id].mean():.4f}")
 
-    # --- Shifted ID: corrupted CIFAR-10 (combine corruption types) ---
+    # --- Shifted ID: corrupted CIFAR-10 ---
     corrupt_parts = []
-    n_per_corruption = n_shifted // len(CORRUPTION_TYPES)
-    for ctype in CORRUPTION_TYPES:
-        key = f"corrupt_{ctype}_eu"
-        if key not in data:
-            print(f"  Warning: {key} not in cache, skipping")
-            continue
-        corrupted_imgs = apply_corruption(clean_imgs, ctype, seed=CORRUPTION_SEED)
-        eu = data[key]
-        idx = rng.choice(len(eu), size=min(n_per_corruption, len(eu)), replace=False)
-        corrupt_parts.append(EUOnlyDataset(corrupted_imgs[idx], eu[idx]))
-    n_corrupt_actual = sum(len(d) for d in corrupt_parts)
-    if corrupt_parts:
-        print(f"  Shifted (corrupted): {n_corrupt_actual} samples")
+    if n_shifted > 0:
+        n_per_corruption = n_shifted // len(CORRUPTION_TYPES)
+        for ctype in CORRUPTION_TYPES:
+            key = f"corrupt_{ctype}_eu"
+            if key not in data:
+                print(f"  Warning: {key} not in cache, skipping")
+                continue
+            corrupted_imgs = apply_corruption(clean_imgs, ctype, seed=CORRUPTION_SEED)
+            eu = data[key]
+            idx = rng.choice(len(eu), size=min(n_per_corruption, len(eu)), replace=False)
+            corrupt_parts.append(EUOnlyDataset(corrupted_imgs[idx], eu[idx]))
+        n_corrupt_actual = sum(len(d) for d in corrupt_parts)
+        if corrupt_parts:
+            print(f"  Shifted (corrupted): {n_corrupt_actual} samples")
+    else:
+        n_corrupt_actual = 0
 
     # --- OOD or Fake OOD ---
     p2_mode = data.get("p2_data_mode", "ood")
@@ -281,7 +319,9 @@ def build_phase2_datasets(args, data):
         p2_mode = str(p2_mode)
 
     ood_datasets = []
-    if p2_mode == "fake_ood" and "fake_mixup_eu" in data:
+    if n_ood == 0:
+        pass  # A1 or A2: skip OOD tier entirely
+    elif p2_mode == "fake_ood" and "fake_mixup_eu" in data:
         # Fake OOD: mixup + masked (from cache)
         mixup_imgs = torch.from_numpy(data["fake_mixup_imgs"]).float()
         mixup_eu = data["fake_mixup_eu"]
@@ -392,6 +432,20 @@ def main():
 
     parser.add_argument("--phase2_only", action="store_true",
                         help="Skip Phase 1, load existing Phase 1 checkpoint and run Phase 2 only")
+
+    # Ablation study flags
+    parser.add_argument("--curriculum", type=str, default="A3",
+                        choices=["A1", "A2", "A3"],
+                        help="Phase 2 training curriculum. "
+                             "A1=clean only, A2=clean+corrupted, A3=clean+corrupted+OOD (default)")
+    parser.add_argument("--loss_mode", type=str, default="combined",
+                        choices=["mse", "log_mse", "ranking", "combined"],
+                        help="Phase 2 loss. mse=plain MSE, log_mse=log1p-MSE only, "
+                             "ranking=pairwise only, combined=log1p-MSE+ranking (default)")
+    parser.add_argument("--joint", action="store_true",
+                        help="Ablation E: train backbone+classifier+EU head jointly (no phase split)")
+    parser.add_argument("--joint_gamma", type=float, default=1.0,
+                        help="EU loss weight γ when --joint is used (default 1.0)")
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.gpu}" if args.gpu >= 0 and torch.cuda.is_available() else "cpu")
@@ -469,9 +523,98 @@ def main():
     # ==================================================================
     # Phase 2: EU head training (backbone + fc frozen, mixed data)
     # ==================================================================
+    if args.joint:
+        # ==============================================================
+        # Ablation E: Joint training (backbone + classifier + EU head)
+        # ==============================================================
+        print(f"\n{'='*70}")
+        print(f"  Ablation E: JOINT training (backbone+fc+EU head simultaneously)")
+        print(f"  Loss: L_phase1 + {args.joint_gamma} * log1p_MSE(EU)")
+        print(f"  {args.p1_epochs} epochs, lr={args.p1_lr}")
+        print(f"{'='*70}\n")
+
+        for param in model.parameters():
+            param.requires_grad = True
+        model.reinit_eu_head()
+
+        p1_train_loader, p1_test_loader = build_phase1_loaders(
+            args, train_probs, train_eu, test_probs, test_eu)
+
+        optimizer = optim.SGD(model.parameters(), lr=args.p1_lr, momentum=0.9, weight_decay=5e-4)
+        cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.p1_epochs)
+        warmup_scheduler = optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-3, end_factor=1.0, total_iters=args.warmup_epochs)
+        scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[args.warmup_epochs])
+
+        # Build a (img, eu) test loader from the Phase 1 test data (clean only)
+        clean_transform_joint = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
+        ])
+        test_cifar_joint = datasets.CIFAR10(
+            root=args.data_dir, train=False, download=True, transform=clean_transform_joint)
+        test_imgs_joint, _ = _load_tensor_dataset(test_cifar_joint)
+        joint_test_eu_ds = EUOnlyDataset(test_imgs_joint, test_eu)
+        joint_test_eu_loader = DataLoader(joint_test_eu_ds, batch_size=args.batch_size,
+                                          shuffle=False, num_workers=args.num_workers,
+                                          pin_memory=True)
+
+        best_spearman = -1.0
+        best_pearson = 0.0
+
+        for epoch in range(1, args.p1_epochs + 1):
+            t0 = time.time()
+            model.train()
+            sum_ce, sum_eu_loss, correct, total = 0, 0, 0, 0
+            for imgs, labels, t_probs, t_eu_batch in p1_train_loader:
+                imgs = imgs.to(device)
+                labels = labels.to(device)
+                t_probs = t_probs.to(device)
+                t_eu_batch = t_eu_batch.to(device)
+                optimizer.zero_grad()
+                logits, eu_pred = model(imgs)
+                l_p1, ce, _ = phase1_loss(logits, labels, t_probs, args.alpha, args.tau)
+                l_eu = log1p_mse_loss(eu_pred, t_eu_batch)
+                loss = l_p1 + args.joint_gamma * l_eu
+                loss.backward()
+                optimizer.step()
+                bs = imgs.size(0)
+                sum_ce += ce * bs
+                sum_eu_loss += l_eu.detach().item() * bs
+                correct += logits.argmax(1).eq(labels).sum().item()
+                total += bs
+            scheduler.step()
+
+            if epoch % 10 == 0 or epoch == 1:
+                te_ce, te_kl, te_acc = eval_phase1(
+                    model, p1_test_loader, args.alpha, args.tau, device)
+                _te_eu_loss, r_pear, r_spear = eval_phase2(
+                    model, joint_test_eu_loader, device)
+                elapsed = time.time() - t0
+                lr_now = optimizer.param_groups[0]["lr"]
+                print(f"  Joint Ep {epoch:3d}/{args.p1_epochs} | "
+                      f"Train acc={100*correct/total:.2f}% ce={sum_ce/total:.4f} eu={sum_eu_loss/total:.6f} | "
+                      f"Test acc={te_acc:.2f}% Pearson={r_pear:.4f} Spearman={r_spear:.4f} | "
+                      f"LR {lr_now:.6f} | {elapsed:.1f}s")
+                if r_spear > best_spearman:
+                    best_spearman = r_spear
+                    best_pearson = r_pear
+                    torch.save({
+                        "model_state_dict": model.state_dict(),
+                        "epoch": epoch, "test_acc": te_acc,
+                        "eu_pearson": r_pear, "eu_spearman": r_spear, "phase": "joint",
+                    }, final_path)
+
+        print(f"\n  Joint best Spearman: {best_spearman:.4f}  (Pearson: {best_pearson:.4f})")
+        print(f"  Final student saved to: {final_path}")
+        print(f"\n  Next: python evaluate_student.py --save_dir {args.save_dir}")
+        return
+
     print(f"\n{'='*70}")
     print(f"  Phase 2: EU head regression  (backbone + fc frozen)")
-    print(f"  Mixed data: clean + corrupted + OOD")
+    print(f"  Curriculum: {args.curriculum}  |  Loss: {args.loss_mode}")
     print(f"  {args.p2_epochs} epochs, lr={args.p2_lr}")
     print(f"  Loss: log1p_MSE + {args.rank_weight} * PairwiseRankingLoss")
     print(f"{'='*70}\n")
@@ -492,7 +635,7 @@ def main():
 
     # Build mixed dataset
     print("\n  Building mixed Phase 2 dataset...")
-    p2_train_ds, p2_test_ds = build_phase2_datasets(args, data)
+    p2_train_ds, p2_test_ds = build_phase2_datasets(args, data, curriculum=args.curriculum)
 
     all_eu = torch.cat([p2_train_ds.datasets[i].eu for i in range(len(p2_train_ds.datasets))])
     print(f"\n  Mixed EU mean={all_eu.mean():.4f}  std={all_eu.std():.4f}  "
@@ -511,7 +654,8 @@ def main():
     for epoch in range(1, args.p2_epochs + 1):
         t0 = time.time()
         tr_mse, tr_rank = train_phase2_epoch(
-            model, p2_train_loader, optimizer, args.rank_weight, device)
+            model, p2_train_loader, optimizer, args.rank_weight, device,
+            loss_mode=args.loss_mode)
         te_loss, r_pear, r_spear = eval_phase2(model, p2_test_loader, device)
         scheduler.step()
         elapsed = time.time() - t0
