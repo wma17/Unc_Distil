@@ -6,7 +6,7 @@
 #   0. Evaluate main model (existing checkpoint)
 #   A. Ablation A — Phase 2 curriculum  (A1/A2/A3)
 #   B. Ablation B — Phase 2 loss mode   (mse/log_mse/ranking/combined)
-#   C. Ablation C — Ensemble size K     (K=3 and K=5 from existing members)
+#   C. Ablation C — Ensemble size K     (configurable; defaults to K=3,5,7,10)
 #   D. Ablation D — OOD source          (real_ood vs fake_ood)
 #   E. Ablation E — Joint training      (joint vs two-phase)
 #
@@ -18,6 +18,8 @@
 #   bash run_experiments.sh               # run everything
 #   SECTIONS="0 A B" bash run_experiments.sh   # run only selected sections
 #   GPU=1 bash run_experiments.sh
+#   ABLATION_C_KS="1 3 5 7 10" bash run_experiments.sh
+#   K_SOURCE_DIR=./checkpoints_16members bash run_experiments.sh
 # =============================================================================
 set -euo pipefail
 
@@ -27,6 +29,8 @@ SAVE_DIR="${SAVE_DIR:-$ROOT/checkpoints}"   # main trained checkpoint
 GPU="${GPU:-0}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 WORKERS="${WORKERS:-4}"
+K_SOURCE_DIR="${K_SOURCE_DIR:-$ROOT/checkpoints_16members}"
+ABLATION_C_KS="${ABLATION_C_KS:-3 5 7 10}"
 
 # Which sections to run (space-separated). Default = all.
 SECTIONS="${SECTIONS:-0 A B C D E}"
@@ -50,6 +54,7 @@ export PYTHONUNBUFFERED=1
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
 hdr()  { echo; echo "================================================================"; echo "  $*"; echo "================================================================"; }
 skip() { log "SKIP $* — student.pt not found"; }
+count_members() { find "$1" -maxdepth 1 -type f -name 'member_*.pt' | wc -l; }
 
 # Check whether a section is enabled
 has_section() { [[ " $SECTIONS " == *" $1 "* ]]; }
@@ -156,28 +161,52 @@ fi
 # Reuses existing Phase 1 checkpoint (backbone trained with full K=5 teacher),
 # but re-caches teacher EU targets with only K members so Phase 2 learns from
 # a weaker teacher — isolating the effect of teacher ensemble size on EU quality.
-# Note: For K > 5 you must first train more members with train_ensemble.py.
+# By default, K=7/10 are sourced from checkpoints_16members when available.
+# Set ABLATION_C_KS="1 3 5 7 10" to include the degenerate K=1 sanity check.
 # ===========================================================================
 if has_section "C"; then
     hdr "Section C: Ablation — Ensemble size K"
-    N_MEMBERS=$(ls "$SAVE_DIR"/member_*.pt 2>/dev/null | wc -l)
-    log "Found $N_MEMBERS ensemble members in $SAVE_DIR"
+    N_MAIN_MEMBERS=$(count_members "$SAVE_DIR")
+    N_KSOURCE_MEMBERS=0
+    if [ -d "$K_SOURCE_DIR" ]; then
+        N_KSOURCE_MEMBERS=$(count_members "$K_SOURCE_DIR")
+    fi
+    log "Found $N_MAIN_MEMBERS ensemble members in SAVE_DIR=$SAVE_DIR"
+    if [ -d "$K_SOURCE_DIR" ]; then
+        log "Found $N_KSOURCE_MEMBERS ensemble members in K_SOURCE_DIR=$K_SOURCE_DIR"
+    else
+        log "K_SOURCE_DIR not found: $K_SOURCE_DIR"
+    fi
 
-    for K in 3 5; do
-        if [ "$K" -gt "$N_MEMBERS" ]; then
-            log "SKIP K=$K — only $N_MEMBERS members available"
+    for K in $ABLATION_C_KS; do
+        SOURCE_DIR="$SAVE_DIR"
+        SOURCE_COUNT="$N_MAIN_MEMBERS"
+        if [ "$K" -gt "$N_MAIN_MEMBERS" ] && [ -d "$K_SOURCE_DIR" ] && [ "$K" -le "$N_KSOURCE_MEMBERS" ]; then
+            SOURCE_DIR="$K_SOURCE_DIR"
+            SOURCE_COUNT="$N_KSOURCE_MEMBERS"
+        fi
+
+        if [ "$K" -gt "$SOURCE_COUNT" ]; then
+            log "SKIP K=$K — only $SOURCE_COUNT members available in $SOURCE_DIR"
             continue
         fi
+
         ABL_DIR="$ROOT/checkpoints_abl_C_K${K}"
-        log "--- Ensemble size K=${K} ---"
+        log "--- Ensemble size K=${K} (source: $SOURCE_DIR) ---"
         mkdir -p "$ABL_DIR"
+
+        rm -f "$ABL_DIR"/member_*.pt
+
         # Copy only first K members (for re-caching and throughput benchmark)
         for i in $(seq 0 $((K - 1))); do
-            cp "$SAVE_DIR/member_${i}.pt" "$ABL_DIR/"
+            cp "$SOURCE_DIR/member_${i}.pt" "$ABL_DIR/"
         done
         cp "$SAVE_DIR/student_phase1.pt" "$ABL_DIR/"
-        [ -f "$SAVE_DIR/ensemble_configs.json" ] && \
-            cp "$SAVE_DIR/ensemble_configs.json" "$ABL_DIR/" || true
+        if [ -f "$SOURCE_DIR/ensemble_configs.json" ]; then
+            cp "$SOURCE_DIR/ensemble_configs.json" "$ABL_DIR/"
+        elif [ -f "$SAVE_DIR/ensemble_configs.json" ]; then
+            cp "$SAVE_DIR/ensemble_configs.json" "$ABL_DIR/"
+        fi
 
         # Re-cache teacher targets using only K members
         log "Caching teacher targets with K=${K} members..."
