@@ -91,7 +91,7 @@ class TinyImageNetDataset(Dataset):
             if not os.path.isdir(cls_dir):
                 continue
             label = self.class_to_idx[cls_name]
-            for fname in os.listdir(cls_dir):
+            for fname in sorted(os.listdir(cls_dir)):
                 if fname.lower().endswith((".jpeg", ".jpg", ".png")):
                     self.samples.append((os.path.join(cls_dir, fname), label))
 
@@ -249,6 +249,8 @@ FAKE_OOD_SEED = 2027
 MIXUP_LAMBDAS = [0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9]
 MASK_STYLES = ["random_block", "random_pixel", "center_crop_mask", "multi_block", "border_mask"]
 MASK_RATES = [0.3, 0.5, 0.7, 0.8]
+PATCH_SHUFFLE_GRIDS = [2, 4, 7]
+CUTPASTE_BOX_FRACS = [0.15, 0.25, 0.35, 0.5]
 
 
 def _denorm_imagenet(x: torch.Tensor) -> torch.Tensor:
@@ -328,10 +330,72 @@ def apply_masking(images: torch.Tensor, style: str, rate: float, seed: int = FAK
     return masked[0] if squeeze else masked
 
 
+def apply_patch_shuffle(images: torch.Tensor, grid_size: int, seed: int = FAKE_OOD_SEED) -> torch.Tensor:
+    """Shuffle image patches on a fixed grid in raw pixel space."""
+    squeeze = images.dim() == 3
+    if squeeze:
+        images = images.unsqueeze(0)
+
+    raw = _denorm_imagenet(images).clamp(0, 1)
+    n, c, h, w = raw.shape
+    if h % grid_size != 0 or w % grid_size != 0:
+        raise ValueError(f"grid_size={grid_size} must divide image size ({h}, {w})")
+
+    cell_h = h // grid_size
+    cell_w = w // grid_size
+    patches = raw.reshape(n, c, grid_size, cell_h, grid_size, cell_w)
+    patches = patches.permute(0, 2, 4, 1, 3, 5).reshape(
+        n, grid_size * grid_size, c, cell_h, cell_w
+    )
+
+    rng = torch.Generator(device=raw.device).manual_seed(seed)
+    shuffled = patches.clone()
+    for i in range(n):
+        perm = torch.randperm(grid_size * grid_size, generator=rng, device=raw.device)
+        shuffled[i] = patches[i, perm]
+
+    out = shuffled.reshape(n, grid_size, grid_size, c, cell_h, cell_w)
+    out = out.permute(0, 3, 1, 4, 2, 5).reshape(n, c, h, w)
+    out = _renorm_imagenet(out)
+    return out[0] if squeeze else out
+
+
+def apply_cutpaste(
+    images_a: torch.Tensor,
+    images_b: torch.Tensor,
+    box_frac: float,
+    seed: int = FAKE_OOD_SEED,
+) -> torch.Tensor:
+    """Paste a random patch from image B into image A in raw pixel space."""
+    squeeze = images_a.dim() == 3
+    if squeeze:
+        images_a = images_a.unsqueeze(0)
+        images_b = images_b.unsqueeze(0)
+
+    raw_a = _denorm_imagenet(images_a).clamp(0, 1)
+    raw_b = _denorm_imagenet(images_b).clamp(0, 1)
+    out = raw_a.clone()
+    n, _c, h, w = out.shape
+    rng = torch.Generator(device=out.device).manual_seed(seed)
+
+    side = max(1, int((box_frac * h * w) ** 0.5))
+    for i in range(n):
+        top_a = int(torch.randint(0, max(1, h - side + 1), (1,), generator=rng, device=out.device).item())
+        left_a = int(torch.randint(0, max(1, w - side + 1), (1,), generator=rng, device=out.device).item())
+        top_b = int(torch.randint(0, max(1, h - side + 1), (1,), generator=rng, device=out.device).item())
+        left_b = int(torch.randint(0, max(1, w - side + 1), (1,), generator=rng, device=out.device).item())
+        out[i, :, top_a:top_a + side, left_a:left_a + side] = raw_b[i, :, top_b:top_b + side, left_b:left_b + side]
+
+    pasted = _renorm_imagenet(out)
+    return pasted[0] if squeeze else pasted
+
+
 def generate_fake_ood_specs(
     num_source: int,
     n_mixup: int,
     n_masked: int,
+    n_patchshuffle: int = 0,
+    n_cutpaste: int = 0,
     seed: int = FAKE_OOD_SEED,
 ) -> Dict[str, np.ndarray]:
     """Generate deterministic metadata for fake OOD regeneration."""
@@ -355,7 +419,7 @@ def generate_fake_ood_specs(
         masked_style_idx[k] = style_idx
         masked_rates[k] = rate
 
-    return {
+    specs = {
         "fake_mixup_idx_a": mix_a,
         "fake_mixup_idx_b": mix_b,
         "fake_mixup_lambdas": mix_lam,
@@ -364,6 +428,34 @@ def generate_fake_ood_specs(
         "fake_masked_rates": masked_rates,
         "fake_masked_seed_base": np.array(seed + 10000, dtype=np.int64),
     }
+
+    if n_patchshuffle > 0:
+        patch_idx = rng.randint(0, num_source, size=n_patchshuffle).astype(np.int64)
+        patch_grid_sizes = np.empty(n_patchshuffle, dtype=np.int64)
+        for k in range(n_patchshuffle):
+            patch_grid_sizes[k] = PATCH_SHUFFLE_GRIDS[k % len(PATCH_SHUFFLE_GRIDS)]
+        specs.update({
+            "fake_patchshuffle_idx": patch_idx,
+            "fake_patchshuffle_grid_sizes": patch_grid_sizes,
+            "fake_patchshuffle_seed_base": np.array(seed + 20000, dtype=np.int64),
+        })
+
+    if n_cutpaste > 0:
+        cut_idx_a = np.empty(n_cutpaste, dtype=np.int64)
+        cut_idx_b = np.empty(n_cutpaste, dtype=np.int64)
+        cut_box_fracs = np.empty(n_cutpaste, dtype=np.float32)
+        for k in range(n_cutpaste):
+            cut_idx_a[k] = int(perm[(3 * k) % num_source])
+            cut_idx_b[k] = int(perm[(3 * k + 1) % num_source])
+            cut_box_fracs[k] = float(CUTPASTE_BOX_FRACS[k % len(CUTPASTE_BOX_FRACS)])
+        specs.update({
+            "fake_cutpaste_idx_a": cut_idx_a,
+            "fake_cutpaste_idx_b": cut_idx_b,
+            "fake_cutpaste_box_fracs": cut_box_fracs,
+            "fake_cutpaste_seed_base": np.array(seed + 30000, dtype=np.int64),
+        })
+
+    return specs
 
 
 class FakeMixupDataset(Dataset):
@@ -409,23 +501,88 @@ class FakeMaskedDataset(Dataset):
         return masked, 0
 
 
+class FakePatchShuffleDataset(Dataset):
+    """On-the-fly patch-shuffled samples defined by precomputed source indices."""
+
+    def __init__(self, base_ds: Dataset, idxs, grid_sizes, seed_base: int):
+        self.base_ds = base_ds
+        self.idxs = np.asarray(idxs, dtype=np.int64)
+        self.grid_sizes = np.asarray(grid_sizes, dtype=np.int64)
+        self.seed_base = int(seed_base)
+
+    def __len__(self):
+        return len(self.idxs)
+
+    def __getitem__(self, idx):
+        img, _ = self.base_ds[int(self.idxs[idx])]
+        grid = int(self.grid_sizes[idx])
+        shuffled = apply_patch_shuffle(img, grid, seed=self.seed_base + int(idx))
+        return shuffled, 0
+
+
+class FakeCutPasteDataset(Dataset):
+    """On-the-fly cut-paste samples defined by precomputed source indices."""
+
+    def __init__(self, base_ds: Dataset, idx_a, idx_b, box_fracs, seed_base: int):
+        self.base_ds = base_ds
+        self.idx_a = np.asarray(idx_a, dtype=np.int64)
+        self.idx_b = np.asarray(idx_b, dtype=np.int64)
+        self.box_fracs = np.asarray(box_fracs, dtype=np.float32)
+        self.seed_base = int(seed_base)
+
+    def __len__(self):
+        return len(self.idx_a)
+
+    def __getitem__(self, idx):
+        img_a, _ = self.base_ds[int(self.idx_a[idx])]
+        img_b, _ = self.base_ds[int(self.idx_b[idx])]
+        box_frac = float(self.box_fracs[idx])
+        cutpaste = apply_cutpaste(img_a, img_b, box_frac, seed=self.seed_base + int(idx))
+        return cutpaste, 0
+
+
 def build_fake_ood_datasets(base_ds: Dataset, specs: Dict[str, np.ndarray]):
-    """Rebuild fake OOD datasets from cached metadata."""
-    mixup_ds = FakeMixupDataset(
-        base_ds,
-        specs["fake_mixup_idx_a"],
-        specs["fake_mixup_idx_b"],
-        specs["fake_mixup_lambdas"],
-    )
-    seed_base = int(np.asarray(specs["fake_masked_seed_base"]).reshape(-1)[0])
-    masked_ds = FakeMaskedDataset(
-        base_ds,
-        specs["fake_masked_idx"],
-        specs["fake_masked_style_idx"],
-        specs["fake_masked_rates"],
-        seed_base=seed_base,
-    )
-    return mixup_ds, masked_ds
+    """Rebuild fake OOD family datasets from cached metadata."""
+    families: Dict[str, Dataset] = {}
+
+    if {"fake_mixup_idx_a", "fake_mixup_idx_b", "fake_mixup_lambdas"}.issubset(specs):
+        families["mixup"] = FakeMixupDataset(
+            base_ds,
+            specs["fake_mixup_idx_a"],
+            specs["fake_mixup_idx_b"],
+            specs["fake_mixup_lambdas"],
+        )
+
+    if {"fake_masked_idx", "fake_masked_style_idx", "fake_masked_rates", "fake_masked_seed_base"}.issubset(specs):
+        seed_base = int(np.asarray(specs["fake_masked_seed_base"]).reshape(-1)[0])
+        families["masked"] = FakeMaskedDataset(
+            base_ds,
+            specs["fake_masked_idx"],
+            specs["fake_masked_style_idx"],
+            specs["fake_masked_rates"],
+            seed_base=seed_base,
+        )
+
+    if {"fake_patchshuffle_idx", "fake_patchshuffle_grid_sizes", "fake_patchshuffle_seed_base"}.issubset(specs):
+        seed_base = int(np.asarray(specs["fake_patchshuffle_seed_base"]).reshape(-1)[0])
+        families["patchshuffle"] = FakePatchShuffleDataset(
+            base_ds,
+            specs["fake_patchshuffle_idx"],
+            specs["fake_patchshuffle_grid_sizes"],
+            seed_base=seed_base,
+        )
+
+    if {"fake_cutpaste_idx_a", "fake_cutpaste_idx_b", "fake_cutpaste_box_fracs", "fake_cutpaste_seed_base"}.issubset(specs):
+        seed_base = int(np.asarray(specs["fake_cutpaste_seed_base"]).reshape(-1)[0])
+        families["cutpaste"] = FakeCutPasteDataset(
+            base_ds,
+            specs["fake_cutpaste_idx_a"],
+            specs["fake_cutpaste_idx_b"],
+            specs["fake_cutpaste_box_fracs"],
+            seed_base=seed_base,
+        )
+
+    return families
 
 
 # ═══════════════════════════════════════════════════════════════════════════

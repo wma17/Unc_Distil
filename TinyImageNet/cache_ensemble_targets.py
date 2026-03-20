@@ -126,6 +126,10 @@ def main():
                         help="Phase 2 data: 'ood'=real OOD fallback, 'fake_ood'=mixup+masked only")
     parser.add_argument("--fake_ood_mixup_frac", type=float, default=0.5,
                         help="Fraction of fake OOD allocated to mixup; remainder uses masking")
+    parser.add_argument("--fake_ood_patchshuffle_frac", type=float, default=0.0,
+                        help="Fraction of fake OOD allocated to patch-shuffled samples")
+    parser.add_argument("--fake_ood_cutpaste_frac", type=float, default=0.0,
+                        help="Fraction of fake OOD allocated to cut-paste samples")
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
@@ -185,23 +189,47 @@ def main():
         print("Caching: fake OOD datasets ...")
         n_fake = len(train_ds) // 2
         n_mixup = int(n_fake * args.fake_ood_mixup_frac)
-        n_masked = n_fake - n_mixup
-        specs = generate_fake_ood_specs(len(train_ds), n_mixup, n_masked, seed=FAKE_OOD_SEED)
-        mixup_ds, masked_ds = build_fake_ood_datasets(train_ds, specs)
+        n_patchshuffle = int(n_fake * args.fake_ood_patchshuffle_frac)
+        n_cutpaste = int(n_fake * args.fake_ood_cutpaste_frac)
+        n_masked = n_fake - n_mixup - n_patchshuffle - n_cutpaste
+        if n_masked < 0:
+            raise ValueError("Fake OOD fractions must sum to at most 1.0")
 
-        mixup_loader = DataLoader(mixup_ds, batch_size=args.batch_size,
-                                  shuffle=False, num_workers=4, pin_memory=True)
-        masked_loader = DataLoader(masked_ds, batch_size=args.batch_size,
-                                   shuffle=False, num_workers=4, pin_memory=True)
+        specs = generate_fake_ood_specs(
+            len(train_ds),
+            n_mixup,
+            n_masked,
+            n_patchshuffle=n_patchshuffle,
+            n_cutpaste=n_cutpaste,
+            seed=FAKE_OOD_SEED,
+        )
+        fake_datasets = build_fake_ood_datasets(train_ds, specs)
 
-        r_mix = cache_from_loader(members, mixup_loader, device)
-        r_mask = cache_from_loader(members, masked_loader, device)
-        results["fake_mixup_EU"] = r_mix["EU"]
-        results["fake_masked_EU"] = r_mask["EU"]
         results["fake_ood_mixup_frac"] = np.array(args.fake_ood_mixup_frac)
+        results["fake_ood_patchshuffle_frac"] = np.array(args.fake_ood_patchshuffle_frac)
+        results["fake_ood_cutpaste_frac"] = np.array(args.fake_ood_cutpaste_frac)
+        results["fake_ood_masked_frac"] = np.array(max(0.0, 1.0 - args.fake_ood_mixup_frac - args.fake_ood_patchshuffle_frac - args.fake_ood_cutpaste_frac))
         results.update(specs)
-        print(f"  fake mixup: {len(r_mix['EU'])} samples, EU mean={r_mix['EU'].mean():.6f}")
-        print(f"  fake masked: {len(r_mask['EU'])} samples, EU mean={r_mask['EU'].mean():.6f}")
+
+        fake_family_meta = [
+            ("mixup", "fake_mixup_EU", "fake mixup"),
+            ("patchshuffle", "fake_patchshuffle_EU", "fake patchshuffle"),
+            ("cutpaste", "fake_cutpaste_EU", "fake cutpaste"),
+            ("masked", "fake_masked_EU", "fake masked"),
+        ]
+        for family_name, eu_key, label in fake_family_meta:
+            if family_name not in fake_datasets:
+                continue
+            loader = DataLoader(
+                fake_datasets[family_name],
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=4,
+                pin_memory=True,
+            )
+            r = cache_from_loader(members, loader, device)
+            results[eu_key] = r["EU"]
+            print(f"  {label}: {len(r['EU'])} samples, EU mean={r['EU'].mean():.6f}")
 
     # ── 4. OOD datasets ──────────────────────────────────────────────────
     print("Caching: OOD datasets ...")

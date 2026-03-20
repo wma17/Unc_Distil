@@ -57,10 +57,26 @@ def cosine_lr(optimizer, epoch, total_epochs, warmup_epochs, base_lr):
 
 
 def sample_augmentations(rng) -> list[str]:
-    """Sample at least 3 augmentations from the main training pool."""
-    pool = ["randaugment", "mixup", "cutmix", "erasing", "colorjitter"]
-    n_aug = rng.choice([3, 4, 5])
-    return rng.sample(pool, k=n_aug)
+    """Sample a heterogeneous augmentation bundle for one ensemble member."""
+    aug = set()
+
+    policy = rng.choice(["randaugment", "autoaugment", "none"])
+    if policy != "none":
+        aug.add(policy)
+
+    for name, p in [
+        ("mixup", 0.70),
+        ("cutmix", 0.70),
+        ("colorjitter", 0.65),
+        ("erasing", 0.65),
+        ("perspective", 0.35),
+    ]:
+        if rng.random() < p:
+            aug.add(name)
+
+    if not aug:
+        aug.add(rng.choice(["mixup", "cutmix", "colorjitter", "erasing"]))
+    return sorted(aug)
 
 
 def mixup_batch(x, y, alpha=0.2):
@@ -99,18 +115,19 @@ def cutmix_batch(x, y, alpha=1.0):
 def sample_member_config(member_id: int, base_seed: int) -> dict:
     rng = random.Random(base_seed + member_id)
 
-    rank = rng.choice([8, 16, 32])
-    alpha = 8.0 if rank == 8 else 16.0
-    lora_dropout = 0.1 if rank >= 32 else 0.05
-    targets = rng.choice(["qkv+proj", "qkv+proj+mlp"])
-    unfreeze_blocks = 2
+    rank = rng.choice([4, 8, 16, 32])
+    alpha = float(rng.choice([max(rank, 8), max(rank, 8) * 2]))
+    lora_dropout = rng.choice([0.0, 0.05, 0.1])
+    targets = rng.choice(["qkv_only", "qkv+proj", "qkv+proj+mlp"])
+    unfreeze_blocks = rng.choice([0, 1, 2, 4])
 
     aug = sample_augmentations(rng)
-    label_smooth = round(rng.uniform(0.02, 0.05), 3)
-    bag_frac = round(rng.uniform(0.8, 1.0), 2)
-    lr = round(rng.uniform(5e-5, 2e-4), 6)
-    wd = 0.05
-    warmup_epochs = rng.choice([5, 10])
+    label_smooth = round(rng.uniform(0.01, 0.08), 3)
+    bag_frac = round(rng.uniform(0.75, 1.0), 2)
+    lr = round(rng.uniform(5e-5, 2.5e-4), 6)
+    wd = rng.choice([0.01, 0.03, 0.05])
+    warmup_epochs = rng.choice([3, 5, 10])
+    backbone_lr_factor = rng.choice([0.005, 0.01, 0.02, 0.03])
 
     return {
         "member_id": member_id,
@@ -126,6 +143,7 @@ def sample_member_config(member_id: int, base_seed: int) -> dict:
         "lr": lr,
         "weight_decay": wd,
         "warmup_epochs": warmup_epochs,
+        "backbone_lr_factor": backbone_lr_factor,
     }
 
 
@@ -169,11 +187,12 @@ def train_one_member(cfg: dict, args):
     train_ds = TinyImageNetDataset(root, split="train", transform=train_tf)
     val_ds = TinyImageNetDataset(root, split="val", transform=val_tf)
 
+    base_train_len = len(train_ds)
     if cfg["bag_fraction"] < 1.0:
-        n_keep = int(len(train_ds) * cfg["bag_fraction"])
-        indices = torch.randperm(len(train_ds))[:n_keep].tolist()
+        n_keep = int(base_train_len * cfg["bag_fraction"])
+        indices = torch.randperm(base_train_len)[:n_keep].tolist()
         train_ds = Subset(train_ds, indices)
-        print(f"  Bagging: {n_keep}/{len(train_ds) + (len(train_ds.dataset) - n_keep)} samples")
+        print(f"  Bagging: {n_keep}/{base_train_len} samples")
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -190,14 +209,15 @@ def train_one_member(cfg: dict, args):
         unfreeze_blocks=cfg.get("unfreeze_blocks", 0),
     ).to(device)
 
-    param_groups, n_fast, n_slow = build_param_groups(model, args.backbone_lr_factor)
+    backbone_lr_factor = cfg.get("backbone_lr_factor", args.backbone_lr_factor)
+    param_groups, n_fast, n_slow = build_param_groups(model, backbone_lr_factor)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(param_groups, lr=cfg["lr"],
                                   weight_decay=cfg["weight_decay"])
     criterion = nn.CrossEntropyLoss(label_smoothing=cfg["label_smoothing"])
     scaler = GradScaler()
     print(f"  Optimizer groups: head+lora={n_fast} tensors @ x1.0 lr, "
-          f"backbone={n_slow} tensors @ x{args.backbone_lr_factor:.4f} lr")
+          f"backbone={n_slow} tensors @ x{backbone_lr_factor:.4f} lr")
     print(f"  Augmentations: {cfg['augmentations']}")
 
     aug_set = set(cfg["augmentations"])
@@ -210,7 +230,7 @@ def train_one_member(cfg: dict, args):
     best_acc = 0.0
     for epoch in range(args.epochs):
         lr = cosine_lr(optimizer, epoch, args.epochs, cfg["warmup_epochs"], cfg["lr"])
-        backbone_lr = lr * args.backbone_lr_factor if n_slow > 0 else 0.0
+        backbone_lr = lr * backbone_lr_factor if n_slow > 0 else 0.0
         model.train()
         total_loss, correct, total = 0.0, 0, 0
 

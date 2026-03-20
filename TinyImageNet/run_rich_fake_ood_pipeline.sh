@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Recommended full retrain recipe:
+# - cleaner student Phase 1 defaults
+# - more heterogeneous teacher ensemble
+# - richer fake OOD with clean ID still fixed at 50% inside distill.py
+export SAVE_DIR="${SAVE_DIR:-$ROOT/checkpoints_rich_fake_ood_12m}"
+export NUM_MEMBERS="${NUM_MEMBERS:-12}"
+export ENSEMBLE_EPOCHS="${ENSEMBLE_EPOCHS:-50}"
+export ENSEMBLE_BATCH="${ENSEMBLE_BATCH:-64}"
+export DISTILL_BATCH="${DISTILL_BATCH:-32}"
+export WORKERS="${WORKERS:-4}"
+export BACKBONE_LR_FACTOR="${BACKBONE_LR_FACTOR:-0.01}"
+
+export FAKE_OOD_MIXUP_FRAC="${FAKE_OOD_MIXUP_FRAC:-0.25}"
+export FAKE_OOD_PATCHSHUFFLE_FRAC="${FAKE_OOD_PATCHSHUFFLE_FRAC:-0.25}"
+export FAKE_OOD_CUTPASTE_FRAC="${FAKE_OOD_CUTPASTE_FRAC:-0.25}"
+
+export DISTILL_P1_EPOCHS="${DISTILL_P1_EPOCHS:-50}"
+export DISTILL_P1_LR="${DISTILL_P1_LR:-1e-4}"
+export DISTILL_P1_WD="${DISTILL_P1_WD:-0.1}"
+export DISTILL_WARMUP="${DISTILL_WARMUP:-5}"
+export DISTILL_P1_UNFREEZE_BLOCKS="${DISTILL_P1_UNFREEZE_BLOCKS:-12}"
+export DISTILL_P1_BACKBONE_LR_FACTOR="${DISTILL_P1_BACKBONE_LR_FACTOR:-0.01}"
+export DISTILL_LLRD="${DISTILL_LLRD:-0.75}"
+export DISTILL_P1_AUGMENTATIONS="${DISTILL_P1_AUGMENTATIONS:-basic}"
+export DISTILL_P1_LABEL_SMOOTH="${DISTILL_P1_LABEL_SMOOTH:-0.1}"
+export DISTILL_MIXUP_ALPHA="${DISTILL_MIXUP_ALPHA:-0.2}"
+export DISTILL_CUTMIX_ALPHA="${DISTILL_CUTMIX_ALPHA:-1.0}"
+export DISTILL_EMA_DECAY="${DISTILL_EMA_DECAY:-0.999}"
+export DISTILL_GRAD_CLIP="${DISTILL_GRAD_CLIP:-1.0}"
+export DISTILL_ALPHA="${DISTILL_ALPHA:-0.7}"
+export DISTILL_TAU="${DISTILL_TAU:-2.0}"
+export DISTILL_P2_EPOCHS="${DISTILL_P2_EPOCHS:-80}"
+export DISTILL_P2_LR="${DISTILL_P2_LR:-0.003}"
+export DISTILL_RANK_WEIGHT="${DISTILL_RANK_WEIGHT:-0.1}"
+
+exec bash "$ROOT/run_fake_ood_pipeline.sh"

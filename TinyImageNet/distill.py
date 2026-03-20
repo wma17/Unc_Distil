@@ -130,10 +130,13 @@ class KDTrainDataset(torch.utils.data.Dataset):
         return img, label, torch.tensor(self.teacher_probs[idx], dtype=torch.float32)
 
 
-def _build_llrd_param_groups(model, base_lr, wd, n_unfreeze, llrd_factor):
+def _build_llrd_param_groups(model, base_lr, wd, n_unfreeze, llrd_factor,
+                             backbone_lr_factor=0.01):
     """Build parameter groups with layer-wise learning rate decay.
 
-    Later blocks get `base_lr`, earlier blocks get `base_lr * llrd^distance`.
+    Last `n_unfreeze` blocks get `base_lr` with LLRD.
+    Earlier blocks (and embed/pos) get `base_lr * backbone_lr_factor` (very small,
+    like the ensemble backbone_lr_factor so pretrained weights are barely disturbed).
     """
     n_blocks = len(model.blocks)
     first_unfrozen = max(0, n_blocks - n_unfreeze)
@@ -150,6 +153,7 @@ def _build_llrd_param_groups(model, base_lr, wd, n_unfreeze, llrd_factor):
             param_groups.append({"params": [p], "lr": base_lr, "lr_scale": 1.0})
             seen.add(id(p))
 
+    # Active blocks: last n_unfreeze, with LLRD
     for i in range(n_blocks - 1, first_unfrozen - 1, -1):
         dist = (n_blocks - 1) - i
         scale = llrd_factor ** dist
@@ -162,18 +166,30 @@ def _build_llrd_param_groups(model, base_lr, wd, n_unfreeze, llrd_factor):
             })
             for p in block_params:
                 seen.add(id(p))
-            print(f"    block[{i}]: lr_scale={scale:.4f}  lr={block_lr:.6f}")
+            print(f"    block[{i}]: lr_scale={scale:.4f}  lr={block_lr:.6f}  (active)")
 
-    embed_scale = llrd_factor ** min(n_unfreeze, n_blocks)
+    # Deep backbone blocks: very low lr, like ensemble backbone_lr_factor
+    backbone_lr = base_lr * backbone_lr_factor
+    for i in range(first_unfrozen - 1, -1, -1):
+        block_params = [p for p in model.blocks[i].parameters()
+                        if p.requires_grad and id(p) not in seen]
+        if block_params:
+            param_groups.append({
+                "params": block_params, "lr": backbone_lr, "lr_scale": backbone_lr_factor,
+            })
+            for p in block_params:
+                seen.add(id(p))
+            print(f"    block[{i}]: lr_scale={backbone_lr_factor:.4f}  lr={backbone_lr:.6f}  (backbone)")
+
+    # Embed / pos embed: very low lr
     embed_params = [p for p in model.parameters()
                     if p.requires_grad and id(p) not in seen]
     if embed_params:
-        embed_lr = base_lr * embed_scale
         param_groups.append({
-            "params": embed_params, "lr": embed_lr, "lr_scale": embed_scale,
+            "params": embed_params, "lr": backbone_lr, "lr_scale": backbone_lr_factor,
         })
-        print(f"    embed/pos: lr_scale={embed_scale:.4f}  lr={embed_lr:.6f}  "
-              f"({len(embed_params)} tensors)")
+        print(f"    embed/pos: lr_scale={backbone_lr_factor:.4f}  lr={backbone_lr:.6f}  "
+              f"({len(embed_params)} tensors, backbone)")
 
     return param_groups
 
@@ -192,25 +208,18 @@ def run_phase1(model, targets, train_ds, val_ds, args, device):
     n_blocks = len(model.blocks)
     n_unfreeze = min(args.p1_unfreeze_blocks, n_blocks)
 
-    if n_unfreeze >= n_blocks:
-        for p in model.parameters():
-            p.requires_grad = True
-        for p in model.eu_head_parameters:
-            p.requires_grad = False
-    else:
-        for p in model.parameters():
-            p.requires_grad = False
-        for p in model.head.parameters():
-            p.requires_grad = True
-        for i in range(n_blocks - n_unfreeze, n_blocks):
-            for p in model.blocks[i].parameters():
-                p.requires_grad = True
-        for p in model.norm.parameters():
-            p.requires_grad = True
+    # Unfreeze all backbone params; EU head stays frozen.
+    # Deep blocks get a very small lr (backbone_lr_factor) via the param groups.
+    for p in model.parameters():
+        p.requires_grad = True
+    for p in model.eu_head_parameters:
+        p.requires_grad = False
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"  Trainable: {trainable:,} / {total:,}")
+    print(f"  Backbone lr factor: {args.p1_backbone_lr_factor}  "
+          f"(deep blocks lr = {args.p1_lr * args.p1_backbone_lr_factor:.2e})")
 
     kd_ds = KDTrainDataset(train_ds, targets["train_mean_probs"])
     train_loader = DataLoader(
@@ -223,7 +232,8 @@ def run_phase1(model, targets, train_ds, val_ds, args, device):
     )
 
     param_groups = _build_llrd_param_groups(
-        model, args.p1_lr, args.p1_wd, args.p1_unfreeze_blocks, args.llrd)
+        model, args.p1_lr, args.p1_wd, args.p1_unfreeze_blocks, args.llrd,
+        backbone_lr_factor=args.p1_backbone_lr_factor)
     optimizer = torch.optim.AdamW(param_groups, weight_decay=args.p1_wd)
     scaler = GradScaler()
     ema = EMA(model, decay=args.ema_decay)
@@ -378,34 +388,63 @@ def _build_p2_loaders(targets, train_ds, val_ds, args):
     else:
         p2_mode = str(p2_mode)
 
-    fake_keys = {
-        "fake_mixup_idx_a", "fake_mixup_idx_b", "fake_mixup_lambdas",
-        "fake_masked_idx", "fake_masked_style_idx", "fake_masked_rates",
-        "fake_masked_seed_base", "fake_mixup_EU", "fake_masked_EU",
-    }
-    if p2_mode == "fake_ood" and fake_keys.issubset(set(targets.keys())):
-        mixup_frac_arr = targets.get("fake_ood_mixup_frac", np.array(0.5))
-        mixup_frac = float(mixup_frac_arr.flat[0]) if hasattr(mixup_frac_arr, "flat") and mixup_frac_arr.size else 0.5
-        n_mixup_target = min(int(n_ood * mixup_frac), len(targets["fake_mixup_EU"]))
-        n_masked_target = min(n_ood - n_mixup_target, len(targets["fake_masked_EU"]))
+    if p2_mode == "fake_ood":
+        def _scalar_target(name, default):
+            arr = targets.get(name, np.array(default))
+            if hasattr(arr, "flat") and arr.size:
+                return float(arr.flat[0])
+            return float(arr) if np.ndim(arr) == 0 else float(default)
 
-        specs = {key: targets[key] for key in fake_keys if key in targets}
-        mixup_all, masked_all = build_fake_ood_datasets(train_ds, specs)
+        mixup_frac = _scalar_target("fake_ood_mixup_frac", 0.5)
+        patchshuffle_frac = _scalar_target("fake_ood_patchshuffle_frac", 0.0)
+        cutpaste_frac = _scalar_target("fake_ood_cutpaste_frac", 0.0)
+        masked_frac = _scalar_target(
+            "fake_ood_masked_frac",
+            max(0.0, 1.0 - mixup_frac - patchshuffle_frac - cutpaste_frac),
+        )
 
-        idx_m = rng.choice(len(targets["fake_mixup_EU"]), size=n_mixup_target, replace=False) if n_mixup_target > 0 else np.empty(0, dtype=np.int64)
-        idx_k = rng.choice(len(targets["fake_masked_EU"]), size=n_masked_target, replace=False) if n_masked_target > 0 else np.empty(0, dtype=np.int64)
+        fake_specs = {key: targets[key] for key in targets if key.startswith("fake_")}
+        fake_datasets = build_fake_ood_datasets(train_ds, fake_specs)
+        family_meta = [
+            ("mixup", "fake mixup", "fake_mixup_EU", mixup_frac),
+            ("patchshuffle", "fake patchshuffle", "fake_patchshuffle_EU", patchshuffle_frac),
+            ("cutpaste", "fake cutpaste", "fake_cutpaste_EU", cutpaste_frac),
+            ("masked", "fake masked", "fake_masked_EU", masked_frac),
+        ]
+        active_families = [
+            (family_name, label, eu_key, frac)
+            for family_name, label, eu_key, frac in family_meta
+            if family_name in fake_datasets and eu_key in targets and frac > 0 and len(targets[eu_key]) > 0
+        ]
 
-        loaders.append(("fake mixup",
-                        DataLoader(Subset(mixup_all, idx_m.tolist()), batch_size=64,
-                                   num_workers=args.workers, pin_memory=True),
-                        targets["fake_mixup_EU"][idx_m]))
-        loaders.append(("fake masked",
-                        DataLoader(Subset(masked_all, idx_k.tolist()), batch_size=64,
-                                   num_workers=args.workers, pin_memory=True),
-                        targets["fake_masked_EU"][idx_k]))
-        print(f"  Phase 2 data — fake mixup: {len(idx_m)}")
-        print(f"  Phase 2 data — fake masked: {len(idx_k)}")
-    else:
+        total_frac = sum(frac for *_rest, frac in active_families)
+        remaining = n_ood
+        for idx, (family_name, label, eu_key, frac) in enumerate(active_families):
+            family_eu = targets[eu_key]
+            if idx == len(active_families) - 1:
+                n_target = min(remaining, len(family_eu))
+            else:
+                weight = (frac / total_frac) if total_frac > 0 else (1.0 / max(1, len(active_families)))
+                n_target = min(int(n_ood * weight), len(family_eu), remaining)
+
+            if n_target < 1:
+                continue
+
+            idxs = rng.choice(len(family_eu), size=n_target, replace=False)
+            loaders.append((
+                label,
+                DataLoader(
+                    Subset(fake_datasets[family_name], idxs.tolist()),
+                    batch_size=64,
+                    num_workers=args.workers,
+                    pin_memory=True,
+                ),
+                family_eu[idxs],
+            ))
+            remaining -= n_target
+            print(f"  Phase 2 data — {label}: {n_target}")
+
+    if not any(name.startswith("fake ") or name.startswith("OOD ") for name, *_rest in loaders):
         ood_loaders = get_ood_loaders(args.data_dir, batch_size=64, max_samples=max(1, n_ood // 2))
         fallback = [("SVHN", n_ood // 2), ("CIFAR-100", n_ood - (n_ood // 2))]
         for name, target_n in fallback:
@@ -547,6 +586,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--p1_unfreeze_blocks", type=int, default=2,
                         help="Number of last transformer blocks to unfreeze in Phase 1")
+    parser.add_argument("--p1_backbone_lr_factor", type=float, default=0.01,
+                        help="LR multiplier for deep backbone blocks (like ensemble backbone_lr_factor)")
     parser.add_argument("--llrd", type=float, default=0.75,
                         help="Layer-wise learning rate decay factor")
     parser.add_argument("--p1_augmentations", type=str, default="randaugment+colorjitter+erasing",
