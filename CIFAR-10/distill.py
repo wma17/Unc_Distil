@@ -516,7 +516,7 @@ def main():
         print(f"\nSkipping Phase 1, loading {p1_path}")
 
     # Load best Phase 1 model
-    ckpt = torch.load(p1_path, map_location=device, weights_only=True)
+    ckpt = torch.load(p1_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"], strict=False)
     print(f"  Loaded Phase 1 checkpoint (acc={ckpt['test_acc']:.2f}%)")
 

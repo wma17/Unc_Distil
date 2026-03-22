@@ -45,6 +45,21 @@ from models import create_student
 
 # ── Loss / augmentation utilities ─────────────────────────────────────────
 
+def log1p_mse_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """MSE in log(1+x) space — compresses long tail, preserves ranking."""
+    return F.mse_loss(torch.log1p(pred.clamp(min=0)), torch.log1p(target))
+
+
+def asymmetric_log1p_mse_loss(pred: torch.Tensor, target: torch.Tensor,
+                               under_weight: float = 2.0) -> torch.Tensor:
+    """MSE in log(1+x) space with heavier penalty for under-prediction of EU."""
+    log_pred = torch.log1p(pred.clamp(min=0))
+    log_tgt = torch.log1p(target)
+    sq_err = (log_pred - log_tgt) ** 2
+    weights = torch.where(pred < target, under_weight, 1.0)
+    return (weights * sq_err).mean()
+
+
 def pairwise_ranking_loss(pred: torch.Tensor, target: torch.Tensor,
                           margin: float = 0.0) -> torch.Tensor:
     """Encourage correct relative ordering of EU predictions."""
@@ -398,9 +413,13 @@ def _build_p2_loaders(targets, train_ds, val_ds, args):
         mixup_frac = _scalar_target("fake_ood_mixup_frac", 0.5)
         patchshuffle_frac = _scalar_target("fake_ood_patchshuffle_frac", 0.0)
         cutpaste_frac = _scalar_target("fake_ood_cutpaste_frac", 0.0)
+        heavy_noise_frac = _scalar_target("fake_ood_heavy_noise_frac", 0.0)
+        multi_corrupt_frac = _scalar_target("fake_ood_multi_corrupt_frac", 0.0)
+        pixel_permute_frac = _scalar_target("fake_ood_pixel_permute_frac", 0.0)
+        explicit_sum = mixup_frac + patchshuffle_frac + cutpaste_frac + heavy_noise_frac + multi_corrupt_frac + pixel_permute_frac
         masked_frac = _scalar_target(
             "fake_ood_masked_frac",
-            max(0.0, 1.0 - mixup_frac - patchshuffle_frac - cutpaste_frac),
+            max(0.0, 1.0 - explicit_sum),
         )
 
         fake_specs = {key: targets[key] for key in targets if key.startswith("fake_")}
@@ -410,6 +429,9 @@ def _build_p2_loaders(targets, train_ds, val_ds, args):
             ("patchshuffle", "fake patchshuffle", "fake_patchshuffle_EU", patchshuffle_frac),
             ("cutpaste", "fake cutpaste", "fake_cutpaste_EU", cutpaste_frac),
             ("masked", "fake masked", "fake_masked_EU", masked_frac),
+            ("heavy_noise", "fake heavy_noise", "fake_heavy_noise_EU", heavy_noise_frac),
+            ("multi_corrupt", "fake multi_corrupt", "fake_multi_corrupt_EU", multi_corrupt_frac),
+            ("pixel_permute", "fake pixel_permute", "fake_pixel_permute_EU", pixel_permute_frac),
         ]
         active_families = [
             (family_name, label, eu_key, frac)
@@ -497,8 +519,16 @@ def run_phase2(model, targets, train_ds, val_ds, args, device):
           f"EU range=[{all_eu_tgt.min():.6f}, {all_eu_tgt.max():.6f}]")
 
     feat_ds = TensorDataset(all_eu_in, all_eu_tgt)
-    feat_loader = DataLoader(feat_ds, batch_size=256, shuffle=True,
-                             num_workers=0, drop_last=True)
+    if args.eu_sample_alpha > 0:
+        sampling_weights = 1.0 + args.eu_sample_alpha * all_eu_tgt.clamp(min=0)
+        sampler = torch.utils.data.WeightedRandomSampler(
+            sampling_weights, len(sampling_weights), replacement=True)
+        feat_loader = DataLoader(feat_ds, batch_size=256, sampler=sampler,
+                                 num_workers=0, drop_last=True)
+        print(f"  EU-weighted sampling enabled (alpha={args.eu_sample_alpha})")
+    else:
+        feat_loader = DataLoader(feat_ds, batch_size=256, shuffle=True,
+                                 num_workers=0, drop_last=True)
 
     val_loader = DataLoader(
         TinyImageNetDataset(download_tiny_imagenet(args.data_dir), split="val",
@@ -525,7 +555,11 @@ def run_phase2(model, targets, train_ds, val_ds, args, device):
             optimizer.zero_grad(set_to_none=True)
             eu_pred = model.eu_fc2(
                 F.leaky_relu(model.eu_fc1(eu_in_batch), 0.1)).squeeze(-1)
-            mse = F.mse_loss(eu_pred, eu_tgt_batch)
+            if args.asymmetric_weight > 1.0:
+                mse = asymmetric_log1p_mse_loss(eu_pred, eu_tgt_batch,
+                                                 under_weight=args.asymmetric_weight)
+            else:
+                mse = log1p_mse_loss(eu_pred, eu_tgt_batch)
             rank = pairwise_ranking_loss(eu_pred, eu_tgt_batch)
             loss = mse + args.rank_weight * rank
 
@@ -600,9 +634,13 @@ def main():
     parser.add_argument("--alpha", type=float, default=0.7)
     parser.add_argument("--tau", type=float, default=2.0)
 
-    parser.add_argument("--p2_epochs", type=int, default=80)
+    parser.add_argument("--p2_epochs", type=int, default=150)
     parser.add_argument("--p2_lr", type=float, default=0.003)
-    parser.add_argument("--rank_weight", type=float, default=0.1)
+    parser.add_argument("--rank_weight", type=float, default=1.0)
+    parser.add_argument("--asymmetric_weight", type=float, default=2.0,
+                        help="Under-prediction penalty multiplier for asymmetric loss (1.0=symmetric)")
+    parser.add_argument("--eu_sample_alpha", type=float, default=10.0,
+                        help="EU-weighted sampling strength (0=uniform, higher=more tail emphasis)")
 
     parser.add_argument("--phase2_only", action="store_true")
     args = parser.parse_args()

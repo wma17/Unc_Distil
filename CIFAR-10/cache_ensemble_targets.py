@@ -226,6 +226,9 @@ def main():
     parser.add_argument("--subset_size", type=int, default=None,
                         help="Ablation C: use only the first K ensemble members when computing targets. "
                              "Default=None uses all members found in save_dir.")
+    parser.add_argument("--targets_out", type=str, default=None,
+                        help="Override output path for teacher_targets.npz. "
+                             "Default: <save_dir>/teacher_targets.npz")
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.gpu}" if args.gpu >= 0 and torch.cuda.is_available() else "cpu")
@@ -397,7 +400,7 @@ def main():
     results["p2_data_mode"] = np.array([args.p2_data_mode], dtype=object)
     results["fake_ood_mixup_frac"] = np.array(args.fake_ood_mixup_frac)
 
-    out_path = os.path.join(args.save_dir, "teacher_targets.npz")
+    out_path = args.targets_out if args.targets_out else os.path.join(args.save_dir, "teacher_targets.npz")
     np.savez(out_path, **results)
     print(f"\nSaved all targets to {out_path}")
     print(f"Keys: {sorted(results.keys())}")

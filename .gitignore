@@ -8,6 +8,9 @@ data/
 **/checkpoints*/*.pt
 **/checkpoints*/*.npz
 **/checkpoints*/*.pth
+**/ablation*/*.pt
+**/ablation*/*.npz
+**/ablation*/*.pth
 
 # Python
 __pycache__/

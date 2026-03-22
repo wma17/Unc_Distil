@@ -511,7 +511,7 @@ def main():
     sec("9. Inference Throughput", out)
     print(f"\n{'='*60}\n  9. Inference Throughput\n{'='*60}")
 
-    img_shape = (3, 64, 64)
+    img_shape = (3, 224, 224)
     model.eval()
 
     def _stu_fn(x):

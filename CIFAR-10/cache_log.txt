@@ -1,0 +1,72 @@
+Loading ensemble...
+  Loaded member_0.pt  acc=94.66%
+  Loaded member_1.pt  acc=95.50%
+  Loaded member_10.pt  acc=94.87%
+  Loaded member_11.pt  acc=94.95%
+  Loaded member_12.pt  acc=94.90%
+  Loaded member_13.pt  acc=95.71%
+  Loaded member_14.pt  acc=95.31%
+  Loaded member_15.pt  acc=95.29%
+  Loaded member_2.pt  acc=95.28%
+  Loaded member_3.pt  acc=95.67%
+  Loaded member_4.pt  acc=95.95%
+  Loaded member_5.pt  acc=95.53%
+  Loaded member_6.pt  acc=94.49%
+  Loaded member_7.pt  acc=96.16%
+  Loaded member_8.pt  acc=95.44%
+  Loaded member_9.pt  acc=95.89%
+Ensemble size: 16
+
+--- Clean CIFAR-10 train ---
+Files already downloaded and verified
+  TU=0.1471  AU=0.1246  EU=0.0225
+
+--- Clean CIFAR-10 test ---
+Files already downloaded and verified
+  TU=0.2445  AU=0.1901  EU=0.0544
+
+--- Corrupted CIFAR-10 train ---
+  Corruption: gaussian_noise ...
+    TU=0.4382  AU=0.3016  EU=0.1366
+  Corruption: gaussian_blur ...
+    TU=1.5576  AU=0.9974  EU=0.5603
+  Corruption: low_contrast ...
+    TU=0.3591  AU=0.2406  EU=0.1185
+
+--- Corrupted CIFAR-10 test ---
+  Corruption: gaussian_noise ...
+    TU=0.5090  AU=0.3449  EU=0.1641
+  Corruption: gaussian_blur ...
+    TU=1.5543  AU=0.9949  EU=0.5594
+  Corruption: low_contrast ...
+    TU=0.4345  AU=0.2907  EU=0.1438
+
+--- SVHN test (OOD) ---
+Using downloaded and verified file: ../data/svhn/test_32x32.mat
+  TU=1.4916  AU=0.9766  EU=0.5150  n=26032
+
+--- CIFAR-100 test (OOD) ---
+Files already downloaded and verified
+  TU=1.0740  AU=0.7226  EU=0.3514  n=10000
+
+--- Fake OOD (mixup + masked, no external data) ---
+  Target: 50% ID=50k, 25% shifted=25k, 25% fake OOD=25k (mixup=12500, masked=12500)
+  Mixup (λ∈[0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9]): n=12500  EU mean=0.3439
+  Masked (styles=['random_block', 'random_pixel', 'center_crop_mask', 'multi_block', 'border_mask'], rates=[0.3, 0.5, 0.7, 0.8]): n=12500  EU mean=0.4613
+
+--- MNIST (unseen OOD) ---
+  TU=1.2692  AU=0.9384  EU=0.3309  n=10000
+
+--- FASHIONMNIST (unseen OOD) ---
+  TU=1.3671  AU=1.0099  EU=0.3571  n=10000
+
+--- STL10 (unseen OOD) ---
+Files already downloaded and verified
+  TU=0.5148  AU=0.3622  EU=0.1526  n=8000
+
+--- DTD (unseen OOD) ---
+  TU=1.2485  AU=0.8122  EU=0.4362  n=1880
+
+Saved all targets to ./checkpoints_16members/teacher_targets.npz
+Keys: ['cifar100_au', 'cifar100_eu', 'cifar100_tu', 'corrupt_gaussian_blur_au', 'corrupt_gaussian_blur_eu', 'corrupt_gaussian_blur_test_au', 'corrupt_gaussian_blur_test_eu', 'corrupt_gaussian_blur_test_tu', 'corrupt_gaussian_blur_tu', 'corrupt_gaussian_noise_au', 'corrupt_gaussian_noise_eu', 'corrupt_gaussian_noise_test_au', 'corrupt_gaussian_noise_test_eu', 'corrupt_gaussian_noise_test_tu', 'corrupt_gaussian_noise_tu', 'corrupt_low_contrast_au', 'corrupt_low_contrast_eu', 'corrupt_low_contrast_test_au', 'corrupt_low_contrast_test_eu', 'corrupt_low_contrast_test_tu', 'corrupt_low_contrast_tu', 'corruption_seed', 'dtd_au', 'dtd_eu', 'dtd_tu', 'eu_max', 'fake_masked_eu', 'fake_masked_imgs', 'fake_mixup_eu', 'fake_mixup_imgs', 'fake_ood_mixup_frac', 'fashionmnist_au', 'fashionmnist_eu', 'fashionmnist_tu', 'mnist_au', 'mnist_eu', 'mnist_tu', 'p2_data_mode', 'stl10_au', 'stl10_eu', 'stl10_tu', 'svhn_au', 'svhn_eu', 'svhn_tu', 'test_au', 'test_eu', 'test_labels', 'test_probs', 'test_tu', 'train_au', 'train_eu', 'train_labels', 'train_probs', 'train_tu']
+CACHE EXIT:

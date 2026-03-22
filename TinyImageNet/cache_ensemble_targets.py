@@ -130,6 +130,12 @@ def main():
                         help="Fraction of fake OOD allocated to patch-shuffled samples")
     parser.add_argument("--fake_ood_cutpaste_frac", type=float, default=0.0,
                         help="Fraction of fake OOD allocated to cut-paste samples")
+    parser.add_argument("--fake_ood_heavy_noise_frac", type=float, default=0.0,
+                        help="Fraction of fake OOD allocated to heavy Gaussian noise (sigma 0.3-1.0)")
+    parser.add_argument("--fake_ood_multi_corrupt_frac", type=float, default=0.0,
+                        help="Fraction of fake OOD allocated to multi-corruption stacking")
+    parser.add_argument("--fake_ood_pixel_permute_frac", type=float, default=0.0,
+                        help="Fraction of fake OOD allocated to pixel permutation within ViT patches")
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
@@ -191,7 +197,10 @@ def main():
         n_mixup = int(n_fake * args.fake_ood_mixup_frac)
         n_patchshuffle = int(n_fake * args.fake_ood_patchshuffle_frac)
         n_cutpaste = int(n_fake * args.fake_ood_cutpaste_frac)
-        n_masked = n_fake - n_mixup - n_patchshuffle - n_cutpaste
+        n_heavy_noise = int(n_fake * args.fake_ood_heavy_noise_frac)
+        n_multi_corrupt = int(n_fake * args.fake_ood_multi_corrupt_frac)
+        n_pixel_permute = int(n_fake * args.fake_ood_pixel_permute_frac)
+        n_masked = n_fake - n_mixup - n_patchshuffle - n_cutpaste - n_heavy_noise - n_multi_corrupt - n_pixel_permute
         if n_masked < 0:
             raise ValueError("Fake OOD fractions must sum to at most 1.0")
 
@@ -201,14 +210,23 @@ def main():
             n_masked,
             n_patchshuffle=n_patchshuffle,
             n_cutpaste=n_cutpaste,
+            n_heavy_noise=n_heavy_noise,
+            n_multi_corrupt=n_multi_corrupt,
+            n_pixel_permute=n_pixel_permute,
             seed=FAKE_OOD_SEED,
         )
         fake_datasets = build_fake_ood_datasets(train_ds, specs)
 
+        all_fracs = (args.fake_ood_mixup_frac + args.fake_ood_patchshuffle_frac +
+                     args.fake_ood_cutpaste_frac + args.fake_ood_heavy_noise_frac +
+                     args.fake_ood_multi_corrupt_frac + args.fake_ood_pixel_permute_frac)
         results["fake_ood_mixup_frac"] = np.array(args.fake_ood_mixup_frac)
         results["fake_ood_patchshuffle_frac"] = np.array(args.fake_ood_patchshuffle_frac)
         results["fake_ood_cutpaste_frac"] = np.array(args.fake_ood_cutpaste_frac)
-        results["fake_ood_masked_frac"] = np.array(max(0.0, 1.0 - args.fake_ood_mixup_frac - args.fake_ood_patchshuffle_frac - args.fake_ood_cutpaste_frac))
+        results["fake_ood_heavy_noise_frac"] = np.array(args.fake_ood_heavy_noise_frac)
+        results["fake_ood_multi_corrupt_frac"] = np.array(args.fake_ood_multi_corrupt_frac)
+        results["fake_ood_pixel_permute_frac"] = np.array(args.fake_ood_pixel_permute_frac)
+        results["fake_ood_masked_frac"] = np.array(max(0.0, 1.0 - all_fracs))
         results.update(specs)
 
         fake_family_meta = [
@@ -216,6 +234,9 @@ def main():
             ("patchshuffle", "fake_patchshuffle_EU", "fake patchshuffle"),
             ("cutpaste", "fake_cutpaste_EU", "fake cutpaste"),
             ("masked", "fake_masked_EU", "fake masked"),
+            ("heavy_noise", "fake_heavy_noise_EU", "fake heavy_noise"),
+            ("multi_corrupt", "fake_multi_corrupt_EU", "fake multi_corrupt"),
+            ("pixel_permute", "fake_pixel_permute_EU", "fake pixel_permute"),
         ]
         for family_name, eu_key, label in fake_family_meta:
             if family_name not in fake_datasets:

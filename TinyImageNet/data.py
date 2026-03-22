@@ -248,9 +248,19 @@ CORRUPTIONS = {
 FAKE_OOD_SEED = 2027
 MIXUP_LAMBDAS = [0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9]
 MASK_STYLES = ["random_block", "random_pixel", "center_crop_mask", "multi_block", "border_mask"]
-MASK_RATES = [0.3, 0.5, 0.7, 0.8]
+MASK_RATES = [0.3, 0.5, 0.7, 0.8, 0.9, 0.95]
 PATCH_SHUFFLE_GRIDS = [2, 4, 7]
 CUTPASTE_BOX_FRACS = [0.15, 0.25, 0.35, 0.5]
+HEAVY_NOISE_SIGMAS = [0.3, 0.5, 0.8, 1.0]
+MULTI_CORRUPT_COMBOS = [
+    ("gaussian_noise", "gaussian_blur"),
+    ("gaussian_noise", "low_contrast"),
+    ("gaussian_blur", "low_contrast"),
+    ("shot_noise", "gaussian_blur"),
+    ("gaussian_noise", "gaussian_blur", "low_contrast"),
+    ("shot_noise", "brightness", "gaussian_blur"),
+]
+VIT_PATCH_SIZE = 16  # DeiT-S patch size
 
 
 def _denorm_imagenet(x: torch.Tensor) -> torch.Tensor:
@@ -390,12 +400,126 @@ def apply_cutpaste(
     return pasted[0] if squeeze else pasted
 
 
+def apply_heavy_noise(images: torch.Tensor, sigma: float, seed: int = FAKE_OOD_SEED) -> torch.Tensor:
+    """Apply very heavy Gaussian noise in raw pixel space."""
+    squeeze = images.dim() == 3
+    if squeeze:
+        images = images.unsqueeze(0)
+    raw = _denorm_imagenet(images).clamp(0, 1)
+    rng = torch.Generator(device=raw.device).manual_seed(seed)
+    noisy = raw + torch.randn(raw.shape, generator=rng, device=raw.device) * sigma
+    out = _renorm_imagenet(noisy.clamp(0, 1))
+    return out[0] if squeeze else out
+
+
+def apply_multi_corrupt(images: torch.Tensor, corrupt_names: tuple, seed: int = FAKE_OOD_SEED) -> torch.Tensor:
+    """Stack 2-3 corruptions on the same image."""
+    out = images.clone()
+    for cname in corrupt_names:
+        if cname in CORRUPTIONS:
+            out = CORRUPTIONS[cname](out)
+    return out
+
+
+def apply_pixel_permute(images: torch.Tensor, patch_size: int = VIT_PATCH_SIZE,
+                        seed: int = FAKE_OOD_SEED) -> torch.Tensor:
+    """Randomly permute pixels within each ViT-sized patch, destroying local structure."""
+    squeeze = images.dim() == 3
+    if squeeze:
+        images = images.unsqueeze(0)
+    raw = _denorm_imagenet(images).clamp(0, 1)
+    n, c, h, w = raw.shape
+    rng = torch.Generator(device=raw.device).manual_seed(seed)
+
+    ph = h // patch_size
+    pw = w // patch_size
+    # reshape into patches: (n, c, ph, patch_size, pw, patch_size)
+    crop_h, crop_w = ph * patch_size, pw * patch_size
+    cropped = raw[:, :, :crop_h, :crop_w]
+    patches = cropped.reshape(n, c, ph, patch_size, pw, patch_size)
+    patches = patches.permute(0, 2, 4, 1, 3, 5)  # (n, ph, pw, c, patch_size, patch_size)
+    patches = patches.reshape(n, ph * pw, c, patch_size * patch_size)
+
+    for i in range(n):
+        for p in range(ph * pw):
+            perm = torch.randperm(patch_size * patch_size, generator=rng, device=raw.device)
+            patches[i, p] = patches[i, p, :, perm]
+
+    patches = patches.reshape(n, ph, pw, c, patch_size, patch_size)
+    patches = patches.permute(0, 3, 1, 4, 2, 5)  # (n, c, ph, patch_size, pw, patch_size)
+    out = patches.reshape(n, c, crop_h, crop_w)
+    # Pad back if needed
+    if crop_h < h or crop_w < w:
+        full = raw.clone()
+        full[:, :, :crop_h, :crop_w] = out
+        out = full
+    out = _renorm_imagenet(out)
+    return out[0] if squeeze else out
+
+
+class FakeHeavyNoiseDataset(Dataset):
+    """On-the-fly heavy Gaussian noise samples."""
+
+    def __init__(self, base_ds: Dataset, idxs, sigmas, seed_base: int):
+        self.base_ds = base_ds
+        self.idxs = np.asarray(idxs, dtype=np.int64)
+        self.sigmas = np.asarray(sigmas, dtype=np.float32)
+        self.seed_base = int(seed_base)
+
+    def __len__(self):
+        return len(self.idxs)
+
+    def __getitem__(self, idx):
+        img, _ = self.base_ds[int(self.idxs[idx])]
+        sigma = float(self.sigmas[idx])
+        noisy = apply_heavy_noise(img, sigma, seed=self.seed_base + int(idx))
+        return noisy, 0
+
+
+class FakeMultiCorruptDataset(Dataset):
+    """On-the-fly multi-corruption stacked samples."""
+
+    def __init__(self, base_ds: Dataset, idxs, combo_idxs):
+        self.base_ds = base_ds
+        self.idxs = np.asarray(idxs, dtype=np.int64)
+        self.combo_idxs = np.asarray(combo_idxs, dtype=np.int64)
+
+    def __len__(self):
+        return len(self.idxs)
+
+    def __getitem__(self, idx):
+        img, _ = self.base_ds[int(self.idxs[idx])]
+        combo = MULTI_CORRUPT_COMBOS[int(self.combo_idxs[idx]) % len(MULTI_CORRUPT_COMBOS)]
+        corrupted = apply_multi_corrupt(img, combo)
+        return corrupted, 0
+
+
+class FakePixelPermuteDataset(Dataset):
+    """On-the-fly pixel permutation within ViT patches."""
+
+    def __init__(self, base_ds: Dataset, idxs, seed_base: int):
+        self.base_ds = base_ds
+        self.idxs = np.asarray(idxs, dtype=np.int64)
+        self.seed_base = int(seed_base)
+
+    def __len__(self):
+        return len(self.idxs)
+
+    def __getitem__(self, idx):
+        img, _ = self.base_ds[int(self.idxs[idx])]
+        permuted = apply_pixel_permute(img, seed=self.seed_base + int(idx))
+        return permuted, 0
+
+
 def generate_fake_ood_specs(
     num_source: int,
     n_mixup: int,
     n_masked: int,
     n_patchshuffle: int = 0,
     n_cutpaste: int = 0,
+    n_heavy_noise: int = 0,
+    n_multi_corrupt: int = 0,
+    n_pixel_permute: int = 0,
     seed: int = FAKE_OOD_SEED,
 ) -> Dict[str, np.ndarray]:
     """Generate deterministic metadata for fake OOD regeneration."""
@@ -453,6 +577,34 @@ def generate_fake_ood_specs(
             "fake_cutpaste_idx_b": cut_idx_b,
             "fake_cutpaste_box_fracs": cut_box_fracs,
             "fake_cutpaste_seed_base": np.array(seed + 30000, dtype=np.int64),
+        })
+
+    if n_heavy_noise > 0:
+        hn_idx = rng.randint(0, num_source, size=n_heavy_noise).astype(np.int64)
+        hn_sigmas = np.empty(n_heavy_noise, dtype=np.float32)
+        for k in range(n_heavy_noise):
+            hn_sigmas[k] = float(HEAVY_NOISE_SIGMAS[k % len(HEAVY_NOISE_SIGMAS)])
+        specs.update({
+            "fake_heavy_noise_idx": hn_idx,
+            "fake_heavy_noise_sigmas": hn_sigmas,
+            "fake_heavy_noise_seed_base": np.array(seed + 40000, dtype=np.int64),
+        })
+
+    if n_multi_corrupt > 0:
+        mc_idx = rng.randint(0, num_source, size=n_multi_corrupt).astype(np.int64)
+        mc_combo_idx = np.empty(n_multi_corrupt, dtype=np.int64)
+        for k in range(n_multi_corrupt):
+            mc_combo_idx[k] = k % len(MULTI_CORRUPT_COMBOS)
+        specs.update({
+            "fake_multi_corrupt_idx": mc_idx,
+            "fake_multi_corrupt_combo_idx": mc_combo_idx,
+        })
+
+    if n_pixel_permute > 0:
+        pp_idx = rng.randint(0, num_source, size=n_pixel_permute).astype(np.int64)
+        specs.update({
+            "fake_pixel_permute_idx": pp_idx,
+            "fake_pixel_permute_seed_base": np.array(seed + 50000, dtype=np.int64),
         })
 
     return specs
@@ -579,6 +731,30 @@ def build_fake_ood_datasets(base_ds: Dataset, specs: Dict[str, np.ndarray]):
             specs["fake_cutpaste_idx_a"],
             specs["fake_cutpaste_idx_b"],
             specs["fake_cutpaste_box_fracs"],
+            seed_base=seed_base,
+        )
+
+    if {"fake_heavy_noise_idx", "fake_heavy_noise_sigmas", "fake_heavy_noise_seed_base"}.issubset(specs):
+        seed_base = int(np.asarray(specs["fake_heavy_noise_seed_base"]).reshape(-1)[0])
+        families["heavy_noise"] = FakeHeavyNoiseDataset(
+            base_ds,
+            specs["fake_heavy_noise_idx"],
+            specs["fake_heavy_noise_sigmas"],
+            seed_base=seed_base,
+        )
+
+    if {"fake_multi_corrupt_idx", "fake_multi_corrupt_combo_idx"}.issubset(specs):
+        families["multi_corrupt"] = FakeMultiCorruptDataset(
+            base_ds,
+            specs["fake_multi_corrupt_idx"],
+            specs["fake_multi_corrupt_combo_idx"],
+        )
+
+    if {"fake_pixel_permute_idx", "fake_pixel_permute_seed_base"}.issubset(specs):
+        seed_base = int(np.asarray(specs["fake_pixel_permute_seed_base"]).reshape(-1)[0])
+        families["pixel_permute"] = FakePixelPermuteDataset(
+            base_ds,
+            specs["fake_pixel_permute_idx"],
             seed_base=seed_base,
         )
 
