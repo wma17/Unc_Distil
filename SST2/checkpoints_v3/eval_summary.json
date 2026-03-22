@@ -1,0 +1,10 @@
+{
+  "experiment": "E5_SST2",
+  "teacher_acc": 91.51375889778137,
+  "student_acc": 92.08715558052063,
+  "student_ece": 0.02510001107093387,
+  "student_nll": 0.21640102565288544,
+  "student_brier": 0.1272372454404831,
+  "eu_pearson_clean": 0.4858730733394623,
+  "eu_spearman_clean": 0.5770711898803711
+}

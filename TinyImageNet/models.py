@@ -159,8 +159,11 @@ class DeiTStudent(nn.Module):
         nn.init.zeros_(self.head.bias)
 
         eu_in = self.FEAT_DIM + num_classes
-        self.eu_fc1 = nn.Linear(eu_in, eu_hidden)
-        self.eu_fc2 = nn.Linear(eu_hidden, 1)
+        self.eu_fc1 = nn.Linear(eu_in, 512)
+        self.eu_drop = nn.Dropout(0.15)
+        self.eu_fc2 = nn.Linear(512, 128)
+        self.eu_fc3 = nn.Linear(128, 1)
+        self.eu_scale = nn.Parameter(torch.ones(1))
 
     def _features(self, x: torch.Tensor) -> torch.Tensor:
         x = self.patch_embed(x)
@@ -178,19 +181,27 @@ class DeiTStudent(nn.Module):
         with torch.no_grad():
             probs = F.softmax(logits, dim=-1)
         eu_in = torch.cat([feat.detach(), probs], dim=-1)
-        eu = self.eu_fc2(F.leaky_relu(self.eu_fc1(eu_in), 0.1)).squeeze(-1)
+        eu = F.leaky_relu(self.eu_fc1(eu_in), 0.1)
+        eu = self.eu_drop(eu)
+        eu = F.leaky_relu(self.eu_fc2(eu), 0.1)
+        eu = (self.eu_scale * self.eu_fc3(eu)).squeeze(-1)
         return logits, eu
 
     @property
     def eu_head_parameters(self):
         yield from self.eu_fc1.parameters()
         yield from self.eu_fc2.parameters()
+        yield from self.eu_fc3.parameters()
+        yield self.eu_scale
 
     def reinit_eu_head(self):
         nn.init.kaiming_normal_(self.eu_fc1.weight)
         nn.init.zeros_(self.eu_fc1.bias)
         nn.init.kaiming_normal_(self.eu_fc2.weight)
         nn.init.zeros_(self.eu_fc2.bias)
+        nn.init.kaiming_normal_(self.eu_fc3.weight)
+        nn.init.zeros_(self.eu_fc3.bias)
+        self.eu_scale.data.fill_(1.0)
 
 
 def create_student(num_classes: int = NUM_CLASSES, eu_hidden: int = 256,

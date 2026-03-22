@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import time
+from sklearn.isotonic import IsotonicRegression
 
 import numpy as np
 import torch
@@ -286,6 +287,16 @@ def main():
     for dname, p, s, sm, tm in corr_results:
         w(f"  {dname:<30} {p:>10.4f} {s:>10.4f} {sm:>10.4f} {tm:>10.4f}")
 
+    # ── Post-hoc EU calibration via isotonic regression ──
+    student_eu_clean = s_eu
+    teacher_eu_clean = eu_tgt_val
+    iso_reg = IsotonicRegression(out_of_bounds='clip')
+    iso_reg.fit(student_eu_clean, teacher_eu_clean)
+    print(f"\n  Isotonic calibration fitted on {len(student_eu_clean)} clean val samples")
+    print(f"  Student EU mean: {student_eu_clean.mean():.4f} -> Calibrated: {iso_reg.predict(student_eu_clean).mean():.4f}")
+    print(f"  Teacher EU mean: {teacher_eu_clean.mean():.4f}")
+    student_eu_clean_calibrated = iso_reg.predict(student_eu_clean)
+
     # ── 4a. OOD Detection — SEEN ──
     sec("4a. OOD Detection — SEEN OOD (used in Phase 2 training)", out)
     print(f"\n{'='*60}\n  4a. OOD Detection — SEEN\n{'='*60}")
@@ -306,6 +317,7 @@ def main():
         t_ood_eu = targets.get(t_eu_key)
         t_ood_tu = targets.get(t_tu_key)
 
+        student_eu_ood_calibrated = iso_reg.predict(o_eu)
         w(f"\n  Clean TinyImageNet (neg) vs {name} (pos)")
         w(f"  {'Method':<40} {'AUROC':>8}")
         w(f"  {'-'*48}")
@@ -314,6 +326,7 @@ def main():
         if t_ood_tu is not None:
             w(f"  {'Teacher TU (ensemble entropy)':<40} {auroc_safe(t_id_tu, t_ood_tu):>8.4f}")
         w(f"  {'Student EU (learned)':<40} {auroc_safe(s_eu, o_eu):>8.4f}")
+        w(f"  {'Student EU (calibrated)':<40} {auroc_safe(student_eu_clean_calibrated, student_eu_ood_calibrated):>8.4f}")
         w(f"  {'Student TU (entropy)':<40} {auroc_safe(s_tu, o_tu):>8.4f}")
         w(f"  {'1 - max softmax prob':<40} {auroc_safe(1 - s_probs.max(1), 1 - o_probs.max(1)):>8.4f}")
 
@@ -332,6 +345,7 @@ def main():
         t_ood_eu = targets.get(t_eu_key)
         t_ood_tu = targets.get(t_tu_key)
 
+        student_eu_ood_calibrated = iso_reg.predict(o_eu)
         w(f"\n  Clean TinyImageNet (neg) vs {name} (pos)")
         w(f"  {'Method':<40} {'AUROC':>8}")
         w(f"  {'-'*48}")
@@ -340,6 +354,7 @@ def main():
         if t_ood_tu is not None:
             w(f"  {'Teacher TU (ensemble entropy)':<40} {auroc_safe(t_id_tu, t_ood_tu):>8.4f}")
         w(f"  {'Student EU (learned)':<40} {auroc_safe(s_eu, o_eu):>8.4f}")
+        w(f"  {'Student EU (calibrated)':<40} {auroc_safe(student_eu_clean_calibrated, student_eu_ood_calibrated):>8.4f}")
         w(f"  {'Student TU (entropy)':<40} {auroc_safe(s_tu, o_tu):>8.4f}")
         w(f"  {'1 - max softmax prob':<40} {auroc_safe(1 - s_probs.max(1), 1 - o_probs.max(1)):>8.4f}")
 

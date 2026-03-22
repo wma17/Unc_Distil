@@ -73,6 +73,48 @@ def pairwise_ranking_loss(pred: torch.Tensor, target: torch.Tensor,
     return F.margin_ranking_loss(diff, -diff, sign, margin=margin)
 
 
+def id_suppression_loss(pred, target):
+    """Penalize over-prediction of EU on clean ID samples."""
+    overshoot = F.relu(pred - target)
+    return (overshoot ** 2).mean()
+
+
+def tier_asymmetric_log1p_mse(pred, target, tier_labels):
+    """Asymmetric MSE in log(1+x) space with tier-dependent weighting.
+
+    tier_labels: 0=clean, 1=corrupted, 2=fake_ood
+    - Clean: penalize over-prediction 3x
+    - Fake OOD: penalize under-prediction 2x
+    - Corrupted: symmetric (1x)
+    """
+    log_pred = torch.log1p(pred.clamp(min=0))
+    log_tgt = torch.log1p(target)
+    sq_err = (log_pred - log_tgt) ** 2
+    over = pred > target
+    weights = torch.ones_like(pred)
+    weights[(tier_labels == 0) & over] = 3.0    # clean + over-predict
+    weights[(tier_labels == 2) & (~over)] = 2.0  # OOD + under-predict
+    return (weights * sq_err).mean()
+
+
+def tier_margin_loss(pred, tier_labels, margin1=0.01, margin2=0.02):
+    """Push EU ordering: clean < corrupted < fake_ood."""
+    clean_eu = pred[tier_labels == 0]
+    corrupt_eu = pred[tier_labels == 1]
+    ood_eu = pred[tier_labels == 2]
+
+    loss = pred.new_tensor(0.0)
+    n = min(len(clean_eu), len(corrupt_eu))
+    if n > 0:
+        idx = torch.randperm(n, device=pred.device)
+        loss = loss + F.relu(clean_eu[:n][idx] - corrupt_eu[:n][idx] + margin1).mean()
+    n2 = min(len(corrupt_eu), len(ood_eu))
+    if n2 > 0:
+        idx2 = torch.randperm(n2, device=pred.device)
+        loss = loss + F.relu(corrupt_eu[:n2][idx2] - ood_eu[:n2][idx2] + margin2).mean()
+    return loss
+
+
 def mixup_data(x, y_hard, y_soft, alpha=0.2):
     """MixUp: interpolate images and labels."""
     if alpha <= 0:
@@ -365,6 +407,7 @@ def _build_p2_loaders(targets, train_ds, val_ds, args):
     """Build data loaders for Phase 2 using a 50/25/25 clean/shifted/fake-OOD mix."""
     root = download_tiny_imagenet(args.data_dir)
     loaders = []
+    tier_map = {}  # name -> tier_id (0=clean, 1=corrupted, 2=fake_ood)
     rng = np.random.RandomState(2026)
 
     clean_eu = targets["train_EU"]
@@ -376,6 +419,7 @@ def _build_p2_loaders(targets, train_ds, val_ds, args):
     loaders.append(("clean", DataLoader(clean_sub, batch_size=64,
                                         num_workers=args.workers, pin_memory=True),
                      clean_eu[indices]))
+    tier_map["clean"] = 0
     print(f"  Phase 2 data — clean: {n_clean}")
 
     per_corrupt = max(1, n_shifted // max(len(CORRUPTIONS), 1))
@@ -395,6 +439,7 @@ def _build_p2_loaders(targets, train_ds, val_ds, args):
         c_ds = TensorDataset(c_imgs[:n])
         loaders.append((cname, DataLoader(c_ds, batch_size=64, num_workers=0),
                          c_eu[:n]))
+        tier_map[cname] = 1
         print(f"  Phase 2 data — {cname}: {n}")
 
     p2_mode = targets.get("p2_data_mode", np.array("fake_ood"))
@@ -463,6 +508,7 @@ def _build_p2_loaders(targets, train_ds, val_ds, args):
                 ),
                 family_eu[idxs],
             ))
+            tier_map[label] = 2
             remaining -= n_target
             print(f"  Phase 2 data — {label}: {n_target}")
 
@@ -485,10 +531,11 @@ def _build_p2_loaders(targets, train_ds, val_ds, args):
             loaders.append((f"OOD {name}",
                             DataLoader(ood_ds, batch_size=64, num_workers=0),
                             ood_eu[:n]))
+            tier_map[f"OOD {name}"] = 2
             print(f"  Phase 2 data — OOD {name}: {n}")
             del ood_t
 
-    return loaders
+    return loaders, tier_map
 
 
 def run_phase2(model, targets, train_ds, val_ds, args, device):
@@ -505,20 +552,23 @@ def run_phase2(model, targets, train_ds, val_ds, args, device):
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  EU head trainable params: {trainable:,}")
 
-    p2_sources = _build_p2_loaders(targets, train_ds, val_ds, args)
+    p2_sources, tier_map = _build_p2_loaders(targets, train_ds, val_ds, args)
 
     print("  Extracting backbone features for Phase 2 data ...")
-    all_eu_in, all_eu_tgt = [], []
+    all_eu_in, all_eu_tgt, all_tiers = [], [], []
     for src_name, loader, eu_arr in p2_sources:
         feats = _extract_eu_inputs(model, loader, device)
         all_eu_in.append(feats)
         all_eu_tgt.append(torch.tensor(eu_arr[:len(feats)], dtype=torch.float32))
+        tier_id = tier_map.get(src_name, 1)  # default to corrupted if unknown
+        all_tiers.append(torch.full((len(feats),), tier_id, dtype=torch.long))
     all_eu_in = torch.cat(all_eu_in)
     all_eu_tgt = torch.cat(all_eu_tgt)
+    all_tiers = torch.cat(all_tiers)
     print(f"  Cached {len(all_eu_tgt)} feature vectors ({all_eu_in.shape[-1]}-d)  "
           f"EU range=[{all_eu_tgt.min():.6f}, {all_eu_tgt.max():.6f}]")
 
-    feat_ds = TensorDataset(all_eu_in, all_eu_tgt)
+    feat_ds = TensorDataset(all_eu_in, all_eu_tgt, all_tiers)
     if args.eu_sample_alpha > 0:
         sampling_weights = 1.0 + args.eu_sample_alpha * all_eu_tgt.clamp(min=0)
         sampler = torch.utils.data.WeightedRandomSampler(
@@ -548,20 +598,34 @@ def run_phase2(model, targets, train_ds, val_ds, args, device):
         model.train()
         total_loss, total_mse, total_rank = 0.0, 0.0, 0.0
         count = 0
-        for eu_in_batch, eu_tgt_batch in feat_loader:
+        for eu_in_batch, eu_tgt_batch, tier_batch in feat_loader:
             eu_in_batch = eu_in_batch.to(device, non_blocking=True)
             eu_tgt_batch = eu_tgt_batch.to(device, non_blocking=True)
+            tier_batch = tier_batch.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            eu_pred = model.eu_fc2(
-                F.leaky_relu(model.eu_fc1(eu_in_batch), 0.1)).squeeze(-1)
-            if args.asymmetric_weight > 1.0:
-                mse = asymmetric_log1p_mse_loss(eu_pred, eu_tgt_batch,
-                                                 under_weight=args.asymmetric_weight)
-            else:
-                mse = log1p_mse_loss(eu_pred, eu_tgt_batch)
+            h = F.leaky_relu(model.eu_fc1(eu_in_batch), 0.1)
+            h = model.eu_drop(h)
+            h = F.leaky_relu(model.eu_fc2(h), 0.1)
+            eu_pred = (model.eu_scale * model.eu_fc3(h)).squeeze(-1)
+
+            mse = tier_asymmetric_log1p_mse(eu_pred, eu_tgt_batch, tier_batch)
             rank = pairwise_ranking_loss(eu_pred, eu_tgt_batch)
-            loss = mse + args.rank_weight * rank
+
+            # ID suppression: penalize over-predicting EU on clean data
+            clean_mask = (tier_batch == 0)
+            if clean_mask.any():
+                suppress = id_suppression_loss(
+                    eu_pred[clean_mask], eu_tgt_batch[clean_mask])
+            else:
+                suppress = eu_pred.new_tensor(0.0)
+
+            # Tier margin: push clean < corrupted < OOD
+            margin = tier_margin_loss(eu_pred, tier_batch)
+
+            loss = mse + args.rank_weight * rank \
+                   + args.suppress_weight * suppress \
+                   + args.margin_weight * margin
 
             loss.backward()
             optimizer.step()
@@ -614,11 +678,11 @@ def main():
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--gpu", type=int, default=0)
 
-    parser.add_argument("--p1_epochs", type=int, default=50)
-    parser.add_argument("--p1_lr", type=float, default=1e-4)
+    parser.add_argument("--p1_epochs", type=int, default=100)
+    parser.add_argument("--p1_lr", type=float, default=2e-4)
     parser.add_argument("--p1_wd", type=float, default=0.05)
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--p1_unfreeze_blocks", type=int, default=2,
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--p1_unfreeze_blocks", type=int, default=4,
                         help="Number of last transformer blocks to unfreeze in Phase 1")
     parser.add_argument("--p1_backbone_lr_factor", type=float, default=0.01,
                         help="LR multiplier for deep backbone blocks (like ensemble backbone_lr_factor)")
@@ -634,13 +698,17 @@ def main():
     parser.add_argument("--alpha", type=float, default=0.7)
     parser.add_argument("--tau", type=float, default=2.0)
 
-    parser.add_argument("--p2_epochs", type=int, default=150)
+    parser.add_argument("--p2_epochs", type=int, default=200)
     parser.add_argument("--p2_lr", type=float, default=0.003)
     parser.add_argument("--rank_weight", type=float, default=1.0)
     parser.add_argument("--asymmetric_weight", type=float, default=2.0,
                         help="Under-prediction penalty multiplier for asymmetric loss (1.0=symmetric)")
     parser.add_argument("--eu_sample_alpha", type=float, default=10.0,
                         help="EU-weighted sampling strength (0=uniform, higher=more tail emphasis)")
+    parser.add_argument("--suppress_weight", type=float, default=2.0,
+                        help="Weight for ID EU suppression loss")
+    parser.add_argument("--margin_weight", type=float, default=0.5,
+                        help="Weight for tier margin loss")
 
     parser.add_argument("--phase2_only", action="store_true")
     args = parser.parse_args()

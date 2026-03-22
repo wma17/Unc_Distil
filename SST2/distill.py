@@ -41,20 +41,40 @@ class DistillTextDataset:
     """SST-2 paired with teacher soft labels and EU."""
 
     def __init__(self, texts, labels, teacher_probs, teacher_eu, tokenizer,
-                 max_len=MAX_SEQ_LEN):
+                 max_len=MAX_SEQ_LEN, augment=False):
         self.texts = texts
         self.labels = labels
         self.teacher_probs = torch.from_numpy(teacher_probs).float()
         self.teacher_eu = torch.from_numpy(teacher_eu).float()
         self.tokenizer = tokenizer
         self.max_len = max_len
+        self.augment = augment
+
+    def _augment_text(self, text):
+        """Simple augmentation: random word deletion (10%) + adjacent swap (5%)."""
+        import random
+        words = text.split()
+        if len(words) < 4:
+            return text
+        # Random deletion (keep each word with 90% probability)
+        words = [w for w in words if random.random() > 0.1]
+        if not words:
+            return text
+        # Random adjacent swap
+        for i in range(len(words) - 1):
+            if random.random() < 0.05:
+                words[i], words[i + 1] = words[i + 1], words[i]
+        return ' '.join(words)
 
     def __len__(self):
         return len(self.texts)
 
     def __getitem__(self, idx):
+        text = self.texts[idx]
+        if self.augment:
+            text = self._augment_text(text)
         enc = self.tokenizer(
-            self.texts[idx],
+            text,
             max_length=self.max_len,
             padding="max_length",
             truncation=True,
@@ -84,6 +104,43 @@ def spearman_corr(a, b):
         ranks[order] = torch.arange(len(x), dtype=x.dtype, device=x.device)
         return ranks
     return torch.corrcoef(torch.stack([_rank(a), _rank(b)]))[0, 1].item()
+
+
+def _build_llrd_param_groups_distilbert(model, base_lr, wd, llrd_factor):
+    """Layer-wise learning rate decay for DistilBERT (6 transformer layers)."""
+    param_groups = []
+    seen = set()
+
+    # Classifier: full lr
+    for p in model.classifier.parameters():
+        if p.requires_grad:
+            param_groups.append({"params": [p], "lr": base_lr, "weight_decay": wd})
+            seen.add(id(p))
+
+    # Transformer layers: LLRD from top (layer 5) to bottom (layer 0)
+    n_layers = len(model.distilbert.transformer.layer)
+    for i in range(n_layers - 1, -1, -1):
+        depth = (n_layers - 1) - i
+        layer_lr = base_lr * (llrd_factor ** depth)
+        layer_params = [p for p in model.distilbert.transformer.layer[i].parameters()
+                        if p.requires_grad and id(p) not in seen]
+        if layer_params:
+            param_groups.append({
+                "params": layer_params, "lr": layer_lr, "weight_decay": wd
+            })
+            for p in layer_params:
+                seen.add(id(p))
+
+    # Embeddings: deepest lr
+    embed_lr = base_lr * (llrd_factor ** n_layers)
+    embed_params = [p for p in model.distilbert.embeddings.parameters()
+                    if p.requires_grad and id(p) not in seen]
+    if embed_params:
+        param_groups.append({
+            "params": embed_params, "lr": embed_lr, "weight_decay": wd
+        })
+
+    return param_groups
 
 
 # ---------------------------------------------------------------------------
@@ -332,13 +389,19 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
 
-    parser.add_argument("--p1_epochs", type=int, default=20)
-    parser.add_argument("--p1_lr", type=float, default=2e-4)
+    parser.add_argument("--p1_epochs", type=int, default=50)
+    parser.add_argument("--p1_lr", type=float, default=2e-5)
+    parser.add_argument("--p1_wd", type=float, default=0.05,
+                        help="Weight decay for Phase 1 optimizer")
+    parser.add_argument("--llrd_factor", type=float, default=0.85,
+                        help="Layer-wise learning rate decay factor for DistilBERT")
+    parser.add_argument("--patience", type=int, default=10,
+                        help="Early stopping patience for Phase 1")
     parser.add_argument("--alpha", type=float, default=0.5)
-    parser.add_argument("--tau", type=float, default=6.0)
+    parser.add_argument("--tau", type=float, default=2.0)
 
-    parser.add_argument("--p2_epochs", type=int, default=100)
-    parser.add_argument("--p2_lr", type=float, default=0.001)
+    parser.add_argument("--p2_epochs", type=int, default=200)
+    parser.add_argument("--p2_lr", type=float, default=5e-4)
     parser.add_argument("--rank_weight", type=float, default=1.0)
 
     parser.add_argument("--phase2_only", action="store_true")
@@ -378,7 +441,7 @@ def main():
 
         p1_train_ds = DistillTextDataset(
             train_texts, raw_ds["train"]["label"],
-            data["train_probs"], data["train_eu"], tokenizer)
+            data["train_probs"], data["train_eu"], tokenizer, augment=True)
         p1_dev_ds = DistillTextDataset(
             dev_texts, raw_ds["validation"]["label"],
             data["dev_probs"], data["dev_eu"], tokenizer)
@@ -390,7 +453,9 @@ def main():
                                    shuffle=False, num_workers=args.num_workers,
                                    pin_memory=True, collate_fn=collate_fn)
 
-        optimizer = optim.AdamW(model.parameters(), lr=args.p1_lr, weight_decay=0.01)
+        param_groups = _build_llrd_param_groups_distilbert(
+            model, args.p1_lr, args.p1_wd, args.llrd_factor)
+        optimizer = optim.AdamW(param_groups)
         total_steps = len(p1_train_loader) * args.p1_epochs
         warmup_steps = int(0.1 * total_steps)
 
@@ -402,6 +467,7 @@ def main():
 
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         best_acc = 0.0
+        no_improve = 0
 
         for epoch in range(1, args.p1_epochs + 1):
             t0 = time.time()
@@ -417,10 +483,16 @@ def main():
 
             if te_acc > best_acc:
                 best_acc = te_acc
+                no_improve = 0
                 torch.save({
                     "model_state_dict": model.state_dict(),
                     "epoch": epoch, "dev_acc": te_acc, "phase": 1,
                 }, p1_path)
+            else:
+                no_improve += 1
+                if no_improve >= args.patience:
+                    print(f"  Early stopping at epoch {epoch} (no improvement for {args.patience} epochs)")
+                    break
 
         print(f"\n  Phase 1 best accuracy: {best_acc:.2f}%  ->  {p1_path}")
     else:

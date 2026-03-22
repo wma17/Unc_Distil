@@ -126,7 +126,7 @@ class DistilBERTStudent(nn.Module):
 
     HIDDEN_DIM = 768  # DistilBERT hidden size
 
-    def __init__(self, num_classes: int = 2, eu_hidden: int = 128):
+    def __init__(self, num_classes: int = 2, eu_hidden: int = 256):
         super().__init__()
         self.num_classes = num_classes
         self.distilbert = DistilBertModel.from_pretrained("distilbert-base-uncased")
@@ -136,6 +136,7 @@ class DistilBERTStudent(nn.Module):
 
         eu_in = self.HIDDEN_DIM + num_classes
         self.eu_fc1 = nn.Linear(eu_in, eu_hidden)
+        self.eu_drop = nn.Dropout(0.2)
         self.eu_fc2 = nn.Linear(eu_hidden, 1)
         self.eu_act = nn.Softplus()
 
@@ -147,7 +148,9 @@ class DistilBERTStudent(nn.Module):
         with torch.no_grad():
             probs = F.softmax(logits, dim=-1)
         eu_in = torch.cat([cls_hidden.detach(), probs], dim=-1)
-        eu = self.eu_act(self.eu_fc2(F.relu(self.eu_fc1(eu_in)))).squeeze(-1)
+        eu = F.relu(self.eu_fc1(eu_in))
+        eu = self.eu_drop(eu)
+        eu = self.eu_act(self.eu_fc2(eu)).squeeze(-1)
         return logits, eu
 
     def get_cls_hidden(self, input_ids, attention_mask=None):
@@ -174,5 +177,5 @@ def create_teacher(num_classes=2, rank=8, alpha=16.0, lora_dropout=0.0,
                        init_scale=init_scale)
 
 
-def create_student(num_classes=2, eu_hidden=128):
+def create_student(num_classes=2, eu_hidden=256):
     return DistilBERTStudent(num_classes=num_classes, eu_hidden=eu_hidden)

@@ -1,0 +1,57 @@
+[
+  {
+    "member_id": 0,
+    "seed": 42,
+    "rank": 8,
+    "alpha": 16.0,
+    "init_scale": 1.009,
+    "label_smoothing": 0.0,
+    "attention_dropout": 0.15,
+    "lr": 0.0001,
+    "weight_decay": 0.01
+  },
+  {
+    "member_id": 1,
+    "seed": 43,
+    "rank": 8,
+    "alpha": 16.0,
+    "init_scale": 0.522,
+    "label_smoothing": 0.05,
+    "attention_dropout": 0.1,
+    "lr": 0.0002,
+    "weight_decay": 0.01
+  },
+  {
+    "member_id": 2,
+    "seed": 44,
+    "rank": 8,
+    "alpha": 16.0,
+    "init_scale": 0.783,
+    "label_smoothing": 0.05,
+    "attention_dropout": 0.1,
+    "lr": 0.0001,
+    "weight_decay": 0.01
+  },
+  {
+    "member_id": 3,
+    "seed": 45,
+    "rank": 8,
+    "alpha": 16.0,
+    "init_scale": 0.674,
+    "label_smoothing": 0.02,
+    "attention_dropout": 0.15,
+    "lr": 0.0001,
+    "weight_decay": 0.01
+  },
+  {
+    "member_id": 4,
+    "seed": 46,
+    "rank": 8,
+    "alpha": 16.0,
+    "init_scale": 1.327,
+    "label_smoothing": 0.02,
+    "attention_dropout": 0.1,
+    "lr": 0.0003,
+    "weight_decay": 0.01
+  }
+]
