@@ -134,16 +134,18 @@ def load_member(
 class DeiTStudent(nn.Module):
     """DeiT-Small student with classification head + scalar EU head.
 
-    The EU head takes ``[CLS_features, softmax(logits)]`` as input.
-    No output activation on EU — raw linear value, clamped >= 0 at inference.
+    The EU head takes ``[CLS_features, softmax(logits), (density_features)]`` as input.
+    density_features (5-d) = [energy, entropy, logit_margin, max_cos_centroid, min_dist_centroid]
+    are appended when n_extra_eu=5 and class centroids have been set via set_centroids().
     """
 
     FEAT_DIM = EMBED_DIM  # 384
 
     def __init__(self, num_classes: int = NUM_CLASSES, eu_hidden: int = 256,
-                 drop_path_rate: float = 0.1):
+                 drop_path_rate: float = 0.1, n_extra_eu: int = 0):
         super().__init__()
         self.num_classes = num_classes
+        self.n_extra_eu = n_extra_eu
 
         backbone = timm.create_model("deit_small_patch16_224", pretrained=True,
                                      drop_path_rate=drop_path_rate)
@@ -158,12 +160,59 @@ class DeiTStudent(nn.Module):
         nn.init.trunc_normal_(self.head.weight, std=0.02)
         nn.init.zeros_(self.head.bias)
 
-        eu_in = self.FEAT_DIM + num_classes
-        self.eu_fc1 = nn.Linear(eu_in, 512)
-        self.eu_drop = nn.Dropout(0.15)
-        self.eu_fc2 = nn.Linear(512, 128)
-        self.eu_fc3 = nn.Linear(128, 1)
-        self.eu_scale = nn.Parameter(torch.ones(1))
+        eu_in = self.FEAT_DIM + num_classes + n_extra_eu
+        self.eu_fc1 = nn.Linear(eu_in, eu_hidden)
+        self.eu_fc2 = nn.Linear(eu_hidden, 1)
+        self.eu_act = nn.Softplus()
+
+        # Buffers for density feature computation (set_centroids fills these)
+        self.register_buffer("_centroids", torch.zeros(num_classes, self.FEAT_DIM))
+        self.register_buffer("_density_mean", torch.zeros(n_extra_eu))
+        self.register_buffer("_density_std", torch.ones(n_extra_eu))
+        self._centroids_ready = False
+
+    def set_centroids(self, centroids: torch.Tensor,
+                      density_mean: torch.Tensor, density_std: torch.Tensor):
+        """Store per-class centroids and normalization stats computed from clean training data."""
+        self._centroids.copy_(centroids)
+        self._density_mean.copy_(density_mean)
+        self._density_std.copy_(density_std)
+        self._centroids_ready = True
+
+    def _density_features(self, feat: torch.Tensor,
+                          logits: torch.Tensor) -> torch.Tensor:
+        """Compute 5-d density/geometry features from CLS features and logits."""
+        # Energy score: low for ID, high for OOD
+        energy = -torch.logsumexp(logits, dim=-1, keepdim=True)
+        # Entropy: low for confident ID predictions
+        probs = F.softmax(logits, dim=-1)
+        entropy = -(probs * (probs.clamp(min=1e-10)).log()).sum(dim=-1, keepdim=True)
+        # Logit margin: top1 - top2 (high for confident, low for uncertain)
+        top2 = torch.topk(logits, k=2, dim=-1).values
+        margin = (top2[:, 0] - top2[:, 1]).unsqueeze(-1)
+
+        # Max cosine similarity to per-class centroids (high for ID, low for OOD)
+        cent = self._centroids.to(feat.device)
+        feat_n = F.normalize(feat, dim=-1)
+        cent_n = F.normalize(cent, dim=-1)
+        cos_sims = feat_n @ cent_n.T          # (N, C)
+        max_cos = cos_sims.max(dim=-1).values.unsqueeze(-1)
+
+        # Min L2 distance to nearest centroid (low for ID, high for OOD)
+        feat_sq = (feat ** 2).sum(dim=-1, keepdim=True)   # (N, 1)
+        cent_sq = (cent ** 2).sum(dim=-1)                  # (C,)
+        cross = feat @ cent.T                              # (N, C)
+        dist_sq = (feat_sq + cent_sq - 2 * cross).clamp(min=0)
+        min_dist = dist_sq.min(dim=-1).values.sqrt().unsqueeze(-1)
+
+        raw = torch.cat([energy, entropy, margin, max_cos, min_dist], dim=-1)
+        # Slice to n_extra_eu features (last n from the 5) before normalizing
+        if self.n_extra_eu < 5:
+            raw = raw[:, -self.n_extra_eu:]
+        # Normalize using training-set statistics
+        mean = self._density_mean.to(feat.device)
+        std = self._density_std.to(feat.device).clamp(min=1e-6)
+        return (raw - mean) / std
 
     def _features(self, x: torch.Tensor) -> torch.Tensor:
         x = self.patch_embed(x)
@@ -180,31 +229,27 @@ class DeiTStudent(nn.Module):
 
         with torch.no_grad():
             probs = F.softmax(logits, dim=-1)
-        eu_in = torch.cat([feat.detach(), probs], dim=-1)
-        eu = F.leaky_relu(self.eu_fc1(eu_in), 0.1)
-        eu = self.eu_drop(eu)
-        eu = F.leaky_relu(self.eu_fc2(eu), 0.1)
-        eu = (self.eu_scale * self.eu_fc3(eu)).squeeze(-1)
+            eu_parts = [feat.detach(), probs]
+            if self.n_extra_eu > 0 and self._centroids.abs().max() > 0:
+                eu_parts.append(self._density_features(feat.detach(), logits.detach()))
+        eu_in = torch.cat(eu_parts, dim=-1)
+        eu = F.relu(self.eu_fc1(eu_in))
+        eu = self.eu_act(self.eu_fc2(eu)).squeeze(-1)
         return logits, eu
 
     @property
     def eu_head_parameters(self):
         yield from self.eu_fc1.parameters()
         yield from self.eu_fc2.parameters()
-        yield from self.eu_fc3.parameters()
-        yield self.eu_scale
 
     def reinit_eu_head(self):
         nn.init.kaiming_normal_(self.eu_fc1.weight)
         nn.init.zeros_(self.eu_fc1.bias)
         nn.init.kaiming_normal_(self.eu_fc2.weight)
         nn.init.zeros_(self.eu_fc2.bias)
-        nn.init.kaiming_normal_(self.eu_fc3.weight)
-        nn.init.zeros_(self.eu_fc3.bias)
-        self.eu_scale.data.fill_(1.0)
 
 
 def create_student(num_classes: int = NUM_CLASSES, eu_hidden: int = 256,
-                   drop_path_rate: float = 0.1):
+                   drop_path_rate: float = 0.1, n_extra_eu: int = 0):
     return DeiTStudent(num_classes=num_classes, eu_hidden=eu_hidden,
-                       drop_path_rate=drop_path_rate)
+                       drop_path_rate=drop_path_rate, n_extra_eu=n_extra_eu)

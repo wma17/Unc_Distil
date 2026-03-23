@@ -79,6 +79,25 @@ def id_suppression_loss(pred, target):
     return (overshoot ** 2).mean()
 
 
+def clean_id_cvar_tail_loss(pred, target, tier_labels, tail_frac=0.10):
+    """CVaR tail loss: penalize the worst tail_frac of clean ID EU overshoots.
+
+    Only the top (tail_frac * N_clean) overshoot samples are penalized,
+    leaving the majority of clean ID samples and all OOD predictions untouched.
+    This directly reduces the long tail of clean ID EU without globally
+    suppressing the head.
+    """
+    clean_mask = (tier_labels == 0)
+    if not clean_mask.any():
+        return pred.new_tensor(0.0)
+    clean_pred = pred[clean_mask]
+    clean_tgt = target[clean_mask]
+    overshoot = F.relu(clean_pred - clean_tgt)          # >= 0
+    k = max(1, int(len(overshoot) * tail_frac))
+    top_overshoots, _ = torch.topk(overshoot, k)
+    return top_overshoots.mean()
+
+
 def tier_asymmetric_log1p_mse(pred, target, tier_labels):
     """Asymmetric MSE in log(1+x) space with tier-dependent weighting.
 
@@ -388,19 +407,83 @@ def run_phase1(model, targets, train_ds, val_ds, args, device):
 # ── Phase 2: EU head regression ──────────────────────────────────────────
 
 @torch.no_grad()
-def _extract_eu_inputs(model, loader, device):
-    """Extract [CLS_feat || softmax(logits)] from frozen backbone in batches."""
+def _extract_eu_inputs(model, loader, device, return_raw=False):
+    """Extract [CLS_feat || softmax(logits)] from frozen backbone in batches.
+
+    If return_raw=True, also return raw (feats_384, logits_200, labels) for
+    centroid computation and density feature calculation.
+    """
     model.eval()
-    all_feats = []
-    for imgs, *_ in loader:
-        imgs = imgs.to(device, non_blocking=True)
+    all_eu_in, all_raw_feat, all_logits, all_labels = [], [], [], []
+    for batch in loader:
+        imgs = batch[0].to(device, non_blocking=True)
+        labels = batch[1] if len(batch) > 1 else None
         with autocast():
             feat = model._features(imgs)
             logits = model.head(feat)
             probs = F.softmax(logits, dim=-1)
         eu_in = torch.cat([feat, probs], dim=-1)
-        all_feats.append(eu_in.cpu())
-    return torch.cat(all_feats)
+        all_eu_in.append(eu_in.cpu())
+        if return_raw:
+            all_raw_feat.append(feat.detach().cpu())
+            all_logits.append(logits.detach().cpu())
+            if labels is not None:
+                all_labels.append(labels.cpu() if hasattr(labels, 'cpu') else torch.tensor(labels))
+    eu_in_cat = torch.cat(all_eu_in)
+    if return_raw:
+        raw_feat = torch.cat(all_raw_feat)
+        raw_logits = torch.cat(all_logits)
+        labels_cat = torch.cat(all_labels) if all_labels else None
+        return eu_in_cat, raw_feat, raw_logits, labels_cat
+    return eu_in_cat
+
+
+def _compute_centroids(raw_feats: torch.Tensor, labels: torch.Tensor,
+                       num_classes: int = 200) -> torch.Tensor:
+    """Compute per-class feature centroids from clean training data."""
+    centroids = torch.zeros(num_classes, raw_feats.shape[1])
+    for k in range(num_classes):
+        mask = labels == k
+        if mask.sum() > 0:
+            centroids[k] = raw_feats[mask].mean(0)
+    return centroids
+
+
+def _compute_density_features(raw_feats: torch.Tensor, raw_logits: torch.Tensor,
+                               centroids: torch.Tensor, chunk_size: int = 2048
+                               ) -> torch.Tensor:
+    """Compute 5-d density features: energy, entropy, margin, max_cos, min_dist."""
+    N = raw_feats.shape[0]
+    out = torch.zeros(N, 5, dtype=torch.float32)
+
+    # Energy, entropy, margin are cheap to compute all at once
+    energy = -torch.logsumexp(raw_logits, dim=-1, keepdim=True)
+    probs = F.softmax(raw_logits, dim=-1)
+    entropy = -(probs * probs.clamp(min=1e-10).log()).sum(dim=-1, keepdim=True)
+    top2 = torch.topk(raw_logits, k=2, dim=-1).values
+    margin = (top2[:, 0] - top2[:, 1]).unsqueeze(-1)
+    out[:, :3] = torch.cat([energy, entropy, margin], dim=-1)
+
+    # Centroid-based features — process in chunks to avoid OOM
+    cent_n = F.normalize(centroids, dim=-1)  # (C, 384)
+    cent_sq = (centroids ** 2).sum(dim=-1)   # (C,)
+    for start in range(0, N, chunk_size):
+        end = min(start + chunk_size, N)
+        feat = raw_feats[start:end]           # (n, 384)
+        feat_n = F.normalize(feat, dim=-1)
+
+        cos_sims = feat_n @ cent_n.T          # (n, C)
+        max_cos = cos_sims.max(dim=-1).values # (n,)
+
+        feat_sq = (feat ** 2).sum(dim=-1, keepdim=True)   # (n, 1)
+        cross = feat @ centroids.T            # (n, C)
+        dist_sq = (feat_sq + cent_sq - 2 * cross).clamp(min=0)
+        min_dist = dist_sq.min(dim=-1).values.sqrt()      # (n,)
+
+        out[start:end, 3] = max_cos
+        out[start:end, 4] = min_dist
+
+    return out
 
 
 def _build_p2_loaders(targets, train_ds, val_ds, args):
@@ -555,18 +638,70 @@ def run_phase2(model, targets, train_ds, val_ds, args, device):
     p2_sources, tier_map = _build_p2_loaders(targets, train_ds, val_ds, args)
 
     print("  Extracting backbone features for Phase 2 data ...")
+
+    # When density features are enabled, compute class centroids from clean training
+    # features, then append 5-d density features to all Phase 2 sources.
+    use_density = getattr(args, "density_features", False) and model.n_extra_eu > 0
+    centroids = None
+    # Cache of pre-extracted (eu_in, raw_feat, raw_logits) for clean set to avoid
+    # double extraction when computing centroids.
+    _clean_cache = None
+
+    if use_density:
+        print("  Computing class centroids from clean training features ...")
+        clean_src = next((s for s in p2_sources if s[0] == "clean"), None)
+        if clean_src is not None:
+            _, clean_loader, _ = clean_src
+            result = _extract_eu_inputs(model, clean_loader, device, return_raw=True)
+            _clean_cache = result   # (eu_in, raw_feat, raw_logits, labels)
+            _, raw_feat, _, clean_labels = result
+            if clean_labels is not None:
+                centroids = _compute_centroids(raw_feat, clean_labels)
+                print(f"  Centroids computed: {centroids.shape}")
+            else:
+                print("  WARNING: No labels for clean data — skipping density features")
+                use_density = False
+
     all_eu_in, all_eu_tgt, all_tiers = [], [], []
     for src_name, loader, eu_arr in p2_sources:
-        feats = _extract_eu_inputs(model, loader, device)
-        all_eu_in.append(feats)
-        all_eu_tgt.append(torch.tensor(eu_arr[:len(feats)], dtype=torch.float32))
-        tier_id = tier_map.get(src_name, 1)  # default to corrupted if unknown
-        all_tiers.append(torch.full((len(feats),), tier_id, dtype=torch.long))
+        if use_density and src_name == "clean" and _clean_cache is not None:
+            result = _clean_cache   # reuse cached extraction
+        else:
+            result = _extract_eu_inputs(model, loader, device, return_raw=use_density)
+        if use_density:
+            eu_in, raw_feat, raw_logits, _ = result
+            if centroids is not None:
+                density = _compute_density_features(raw_feat, raw_logits, centroids)
+                # Slice: if n_extra_eu < 5, take last n_extra_eu columns
+                # (features are ordered: energy, entropy, margin, max_cos, min_dist)
+                if model.n_extra_eu < density.shape[1]:
+                    density = density[:, -model.n_extra_eu:]
+                eu_in = torch.cat([eu_in, density], dim=-1)
+        else:
+            eu_in = result
+        all_eu_in.append(eu_in)
+        all_eu_tgt.append(torch.tensor(eu_arr[:len(eu_in)], dtype=torch.float32))
+        tier_id = tier_map.get(src_name, 1)
+        all_tiers.append(torch.full((len(eu_in),), tier_id, dtype=torch.long))
+
     all_eu_in = torch.cat(all_eu_in)
     all_eu_tgt = torch.cat(all_eu_tgt)
     all_tiers = torch.cat(all_tiers)
     print(f"  Cached {len(all_eu_tgt)} feature vectors ({all_eu_in.shape[-1]}-d)  "
           f"EU range=[{all_eu_tgt.min():.6f}, {all_eu_tgt.max():.6f}]")
+
+    if use_density and centroids is not None:
+        # Compute normalization stats from clean training density features (tier=0)
+        clean_mask = all_tiers == 0
+        if clean_mask.sum() > 0:
+            clean_density = all_eu_in[clean_mask, -model.n_extra_eu:]
+            d_mean = clean_density.mean(0)
+            d_std = clean_density.std(0)
+            # Re-normalize all density features using clean training stats
+            all_eu_in[:, -model.n_extra_eu:] = (
+                all_eu_in[:, -model.n_extra_eu:] - d_mean) / d_std.clamp(min=1e-6)
+            model.set_centroids(centroids, d_mean, d_std)
+            print(f"  Density features normalized. Mean: {d_mean.numpy().round(3)}")
 
     feat_ds = TensorDataset(all_eu_in, all_eu_tgt, all_tiers)
     if args.eu_sample_alpha > 0:
@@ -604,26 +739,28 @@ def run_phase2(model, targets, train_ds, val_ds, args, device):
             tier_batch = tier_batch.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            h = F.leaky_relu(model.eu_fc1(eu_in_batch), 0.1)
-            h = model.eu_drop(h)
-            h = F.leaky_relu(model.eu_fc2(h), 0.1)
-            eu_pred = (model.eu_scale * model.eu_fc3(h)).squeeze(-1)
+            eu_in_h = F.relu(model.eu_fc1(eu_in_batch))
+            eu_pred = model.eu_act(model.eu_fc2(eu_in_h)).squeeze(-1)
 
-            mse = tier_asymmetric_log1p_mse(eu_pred, eu_tgt_batch, tier_batch)
+            # Global asymmetric MSE: penalize underprediction 2x everywhere.
+            # This gives the head an upward bias that generalises to unseen OOD.
+            mse = asymmetric_log1p_mse_loss(eu_pred, eu_tgt_batch,
+                                            under_weight=args.asymmetric_weight)
             rank = pairwise_ranking_loss(eu_pred, eu_tgt_batch)
 
-            # ID suppression: penalize over-predicting EU on clean data
-            clean_mask = (tier_batch == 0)
-            if clean_mask.any():
-                suppress = id_suppression_loss(
-                    eu_pred[clean_mask], eu_tgt_batch[clean_mask])
-            else:
-                suppress = eu_pred.new_tensor(0.0)
+            # CVaR tail loss: penalize only the worst-10% clean ID overshoots
+            tail = clean_id_cvar_tail_loss(eu_pred, eu_tgt_batch, tier_batch)
+
+            # ID suppression loss: penalize over-prediction on clean ID samples
+            clean_mask = tier_batch == 0
+            suppress = id_suppression_loss(eu_pred[clean_mask], eu_tgt_batch[clean_mask]) \
+                if clean_mask.any() else eu_pred.new_tensor(0.0)
 
             # Tier margin: push clean < corrupted < OOD
             margin = tier_margin_loss(eu_pred, tier_batch)
 
             loss = mse + args.rank_weight * rank \
+                   + args.tail_weight * tail \
                    + args.suppress_weight * suppress \
                    + args.margin_weight * margin
 
@@ -705,12 +842,21 @@ def main():
                         help="Under-prediction penalty multiplier for asymmetric loss (1.0=symmetric)")
     parser.add_argument("--eu_sample_alpha", type=float, default=10.0,
                         help="EU-weighted sampling strength (0=uniform, higher=more tail emphasis)")
-    parser.add_argument("--suppress_weight", type=float, default=2.0,
-                        help="Weight for ID EU suppression loss")
-    parser.add_argument("--margin_weight", type=float, default=0.5,
+    parser.add_argument("--suppress_weight", type=float, default=0.0,
+                        help="Weight for ID EU suppression loss (legacy; prefer tail_weight)")
+    parser.add_argument("--tail_weight", type=float, default=1.0,
+                        help="Weight for CVaR tail loss on clean ID (penalizes worst-10%% overshoots)")
+    parser.add_argument("--margin_weight", type=float, default=0.0,
                         help="Weight for tier margin loss")
 
     parser.add_argument("--phase2_only", action="store_true")
+    parser.add_argument("--density_features", action="store_true",
+                        help="Augment EU head input with density/geometry features "
+                             "(energy, entropy, margin, max_cos_centroid, min_dist_centroid). "
+                             "Number of features controlled by --n_extra_eu (default 5).")
+    parser.add_argument("--n_extra_eu", type=int, default=5,
+                        help="Number of density features to append (1-5; 2=centroid-only "
+                             "[max_cos, min_dist]). Only used when --density_features is set.")
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
@@ -720,7 +866,8 @@ def main():
     targets = dict(np.load(os.path.join(args.save_dir, "teacher_targets.npz"),
                            allow_pickle=True))
 
-    model = create_student().to(device)
+    n_extra = args.n_extra_eu if args.density_features else 0
+    model = create_student(n_extra_eu=n_extra).to(device)
 
     train_ds = TinyImageNetDataset(
         root,
@@ -736,7 +883,8 @@ def main():
     if os.path.isfile(p1_path):
         ckpt = torch.load(p1_path, map_location=device, weights_only=True)
         src = ckpt.get("ema_state_dict", ckpt["model_state_dict"])
-        state = {k: v for k, v in src.items() if not k.startswith("eu_")}
+        state = {k: v for k, v in src.items()
+                 if not k.startswith("eu_") and not k.startswith("_")}
         model.load_state_dict(state, strict=False)
         print(f"  Loaded Phase 1 EMA checkpoint (val_acc={ckpt.get('val_acc', '?')})")
     else:

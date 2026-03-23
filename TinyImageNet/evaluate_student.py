@@ -175,10 +175,13 @@ def main():
     targets = dict(np.load(os.path.join(args.save_dir, "teacher_targets.npz"),
                            allow_pickle=True))
 
-    model = create_student().to(device)
     ckpt = torch.load(os.path.join(args.save_dir, "student.pt"),
                       map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
+    # Auto-detect n_extra_eu from checkpoint eu_fc1 weight shape
+    eu_fc1_w = ckpt["model_state_dict"].get("eu_fc1.weight")
+    n_extra_eu = max(0, eu_fc1_w.shape[1] - (384 + NUM_CLASSES)) if eu_fc1_w is not None else 0
+    model = create_student(n_extra_eu=n_extra_eu).to(device)
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.eval()
 
     val_ds = TinyImageNetDataset(root, split="val", transform=val_tf)
@@ -260,7 +263,7 @@ def main():
             continue
         c_imgs, c_labels = apply_corruption(val_ds, CORRUPTIONS[cname], max_samples=5000)
         c_ds = TensorDataset(c_imgs, c_labels)
-        c_loader = DataLoader(c_ds, batch_size=args.batch_size, num_workers=2)
+        c_loader = DataLoader(c_ds, batch_size=args.batch_size, num_workers=0)
         _, c_eu, _ = predict_student(model, c_loader, device)
         c_tgt = targets[key][:len(c_eu)]
         if c_eu.std() > 1e-8 and c_tgt.std() > 1e-8:
@@ -370,7 +373,7 @@ def main():
     shift_imgs = torch.cat(shift_imgs_all)
     shift_labels = torch.cat(shift_labels_all)
     shift_ds = TensorDataset(shift_imgs, shift_labels)
-    shift_loader = DataLoader(shift_ds, batch_size=args.batch_size, num_workers=2)
+    shift_loader = DataLoader(shift_ds, batch_size=args.batch_size, num_workers=0)
     shift_probs, shift_eu, shift_lab = predict_student(model, shift_loader, device)
     shift_tu = entropy(shift_probs)
 
